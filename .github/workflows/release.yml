@@ -1,0 +1,41 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: gradle/actions/setup-gradle@v6
+
+      - name: Decode signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+
+      - name: Build APK
+        env:
+          MARCO_KEYSTORE: ${{ runner.temp }}/release.jks
+          MARCO_KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          MARCO_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          MARCO_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          ./gradlew assembleRelease -PversionName="${GITHUB_REF_NAME#v}" -PversionCode="${{ github.run_number }}"
+          cp app/build/outputs/apk/release/app-release.apk "marco-$GITHUB_REF_NAME.apk"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" "marco-$GITHUB_REF_NAME.apk" --verify-tag --generate-notes

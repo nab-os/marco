@@ -14,17 +14,29 @@ android {
         // no legacy location dance.
         minSdk = 31
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0"
+        // CI passes these from the git tag (v1.2.3 → 1.2.3) and the run number.
+        versionCode = (findProperty("versionCode") as String?)?.toInt() ?: 1
+        versionName = (findProperty("versionName") as String?) ?: "0.1.0"
+    }
+
+    signingConfigs {
+        // Release key from the environment (CI secrets); without it, release
+        // builds fall back to the debug key so local `assembleRelease` still works.
+        System.getenv("MARCO_KEYSTORE")?.let { path ->
+            create("release") {
+                storeFile = file(path)
+                storePassword = System.getenv("MARCO_KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("MARCO_KEY_ALIAS")
+                keyPassword = System.getenv("MARCO_KEY_PASSWORD")
+            }
+        }
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"))
-            // Sign with the debug key so `assembleRelease` gives an installable APK
-            // for personal use. Replace with a real signing config if you publish.
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.findByName("release") ?: signingConfigs.getByName("debug")
         }
     }
 
