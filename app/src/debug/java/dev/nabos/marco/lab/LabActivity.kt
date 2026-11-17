@@ -140,7 +140,8 @@ private fun CalibrateMode() {
         } else {
             Text("Views kept: ${s.kept} / ${Calibrator.MAX_VIEWS} (need ${Calibrator.MIN_VIEWS})")
             Text(
-                "Point this camera at the other phone's board from about 10–20 cm. Move slowly: tilt it every " +
+                "Point this camera at the board, on the other phone from 10–20 cm or on a computer screen " +
+                    "(vision/board) from 30–50 cm. Move slowly: tilt it every " +
                     "way, and slide it so the board visits every part of the frame, corners included.",
                 style = MaterialTheme.typography.bodySmall,
             )

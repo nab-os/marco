@@ -5,6 +5,10 @@ edition = "2024"
 description = "Marco's bridge to Vernier: the on-screen calibration board, and camera calibration from it."
 publish = false
 
+[workspace]
+# The desktop board viewer; the Android build only builds this package.
+members = ["board"]
+
 [lib]
 crate-type = ["cdylib", "rlib"]
 

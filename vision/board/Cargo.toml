@@ -1,0 +1,11 @@
+[package]
+name = "marco-board"
+version = "0.1.0"
+edition = "2024"
+description = "Shows Marco's calibration board on a computer screen, pixel for pixel at any window size."
+publish = false
+
+[dependencies]
+marco-vision = { path = ".." }
+softbuffer = "0.4"
+winit = "0.30"

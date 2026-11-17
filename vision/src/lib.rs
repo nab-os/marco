@@ -45,9 +45,12 @@ pub fn render_board(width: usize, height: usize, square_px: f64) -> Vec<u8> {
         square: square_px,
         ..target()
     };
-    in_pixels
-        .checkerboard()
-        .expect("code size 5 is supported")
+    let mut board = in_pixels.checkerboard().expect("code size 5 is supported");
+    if square_px.fract() == 0.0 {
+        // Squares on whole pixels have no edge to smooth: one sample per pixel, crisp and fast.
+        board = board.with_supersample(1);
+    }
+    board
         .render(width, height, &PatternPose::IDENTITY)
         .as_slice()
         .iter()

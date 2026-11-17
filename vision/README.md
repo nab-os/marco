@@ -19,6 +19,18 @@ Debug builds add a **Marco Lab** launcher entry:
 - **Align gyroscope**, once the camera is calibrated (a saved calibration for the same lens and size is loaded automatically). Keep the board in view and turn the phone about every axis for half a minute, then **Align**. Between pairs of frames up to 1.5 s apart, the camera's turn measured by Vernier is matched with the gyroscope's turn over the same interval. That gives the rotation from gyroscope to camera axes, the delay between their clocks, and the gyro's bias. Each frame is stamped at the middle of the exposure of the board's average row, which accounts for the rolling shutter. The result goes into the calibration file under `imu`. It's in [`src/imu.rs`](src/imu.rs).
 - **Record camera + motion** writes raw frames and gyro/accelerometer readings to `files/recordings/`. The **● Rec** button on the Find screen records the Bluetooth signal along with them. The file formats are described in [`Recorder.kt`](../app/src/main/java/dev/nabos/marco/vision/Recorder.kt).
 
+### On a computer screen
+
+A monitor makes a bigger board than a phone: it can fill a wide lens's whole frame, corners included, from 30–50 cm, closer to where a fixed-focus lens is sharp. The board's scale doesn't matter, but it must be shown one board pixel per screen pixel, which `marco-board` does at any window size:
+
+```bash
+cargo run --release -p marco-board -- --square 32   # fullscreen; --windowed for a window
+```
+
+It renders the board again whenever the window changes size, in the background, showing the previous one cropped (never scaled) meanwhile. `+` / `-` change the square size, `F` or F11 toggles fullscreen, `Q` or Esc quits. Each render prints the board's size in squares and the display's scale factor: with fractional scaling, check that the compositor isn't resampling the window. Pick squares that land around 10 pixels or more in the camera's image: about 32 px on a ~110 dpi monitor for a phone ultrawide at 40 cm.
+
+### From adb
+
 `adb shell am start -n dev.nabos.marco/.lab.LabActivity --es mode board` (or `calibrate`, `record`) opens a mode directly, and `adb pull /sdcard/Android/data/dev.nabos.marco/files/` fetches the results.
 
 ## Tests
