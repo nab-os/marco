@@ -2,7 +2,7 @@
 
 Find a misplaced phone in the room from another phone. You call "Marco", it answers "Polo".
 
-Open **Find** on one phone. A hot/cold gauge driven by Bluetooth signal strength, with beeps that speed up as you get closer, leads you to the other phone. Tap **Ring** and it plays its alarm at full volume, even on silent, while vibrating and flashing for 30 s. No internet, account or Google services needed.
+Open **Find** on one phone and walk around holding it up: a map of the room, drawn from the cameras and the Bluetooth signal, shows where the other phone is, with beeps that speed up as you get closer. Tap **Ring** and it plays its alarm at full volume, even on silent, while vibrating and flashing for 30 s. No internet, account or Google services needed.
 
 ## Install
 

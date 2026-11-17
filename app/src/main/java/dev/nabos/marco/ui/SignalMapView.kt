@@ -26,7 +26,7 @@ import kotlin.math.roundToInt
  * The signal map seen from above, turned so the way you face is up, centred
  * on you: where the other phone likely is (warmer = likelier), your path, and
  * the most likely spot ringed by how sure the map is. Rings every metre. You
- * are the arrow, in [youColor]: the hot/cold reading.
+ * are the arrow, in [youColor]: the signal's hot/cold colour.
  */
 @Composable
 fun SignalMapView(m: MapState, youColor: Color, modifier: Modifier) {

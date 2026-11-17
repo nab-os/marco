@@ -73,10 +73,10 @@ class FinderEngine(private val context: Context, private val scope: CoroutineSco
     val state: StateFlow<FinderState> = _state.asStateFlow()
 
     private val _samples = MutableSharedFlow<RssiSample>(extraBufferCapacity = 16, onBufferOverflow = BufferOverflow.DROP_OLDEST)
-    /** Raw readings as they arrive, for "point at it" sweeps. */
+    /** Raw readings as they arrive, for the signal map. */
     val samples: SharedFlow<RssiSample> = _samples.asSharedFlow()
 
-    /** Poll connection RSSI as fast as the link allows, for sweeps. */
+    /** Poll connection RSSI as fast as the link allows, for the signal map. */
     var fastPoll = false
 
     private enum class Source { ADVERT, CONNECTION }

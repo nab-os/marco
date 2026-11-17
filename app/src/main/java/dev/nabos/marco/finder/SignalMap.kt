@@ -16,7 +16,7 @@ import kotlin.math.sqrt
  * path loss model, `rssi = A − 10·n·log10(d) − B·behind`: `A` the level at 1 m
  * (one per source, advert and connection readings differ), `n` how fast it
  * fades, and `B` what your body takes off when the spot is behind you (`behind`
- * goes from 0 facing it to 1 with your back to it, as in [DirectionSweep]).
+ * goes from 0 facing it to 1 with your back to it).
  * `A` is solved per spot, `n` and `B` picked from a few values; the score is how
  * well the best of them fits, turned into a probability over the grid.
  *
@@ -285,7 +285,7 @@ class SignalMap {
         private val BODY_DB = doubleArrayOf(0.0, 3.0, 6.0, 9.0, 12.0, 15.0)
         /**
          * Indoors at 2.4 GHz the exponent is about 2–3, and a body takes off about
-         * 5–10 dB ("point at it"). Left free, the body loss fits each stretch walked
+         * 5–10 dB (measured turning on the spot). Left free, the body loss fits each stretch walked
          * in one direction its own offset, and spots far off fit about as well.
          */
         private const val N_PRIOR = 2.4
