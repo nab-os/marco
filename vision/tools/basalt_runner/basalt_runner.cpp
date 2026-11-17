@@ -1,11 +1,14 @@
 // Runs Basalt on a dataset written by marco_to_basalt.py, through the same VIT
 // C interface the phone will use, and writes the trajectory.
 //
-//   basalt_runner DATASET_DIR CONFIG_JSON TRAJECTORY_CSV
+//   basalt_runner DATASET_DIR CONFIG_JSON TRAJECTORY_CSV [live]
 //
-// DATASET_DIR holds mav0/cam0, mav0/cam1, mav0/imu0 and calib.json. Frames and
-// IMU samples are pushed in time order; Basalt runs deterministically, so a run
-// gives the same trajectory every time.
+// DATASET_DIR holds mav0/cam0, mav0/cam1, mav0/imu0 and calib.json. All frames
+// are decoded into memory first, so the timing is Basalt's alone. By default
+// Basalt runs deterministically, as fast as it can, and a run gives the same
+// trajectory every time. With `live`, it runs pipelined as on the phone and
+// frames are fed at the pace they were recorded: the latency from pushing a
+// frame to getting its pose says whether the device keeps up.
 
 // The header declares the functions only for implementations; we link to one directly.
 #define VIT_INTERFACE_IMPLEMENTATION
@@ -14,7 +17,10 @@
 #include <opencv2/imgcodecs.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <map>
+#include <thread>
 #include <cstdio>
 #include <fstream>
 #include <iostream>
@@ -69,11 +75,14 @@ bool check(vit_result_t result, const char *what) {
 }  // namespace
 
 int main(int argc, char **argv) {
-  if (argc != 4) {
-    std::cerr << "usage: basalt_runner DATASET_DIR CONFIG_JSON TRAJECTORY_CSV\n";
+  if (argc != 4 && !(argc == 5 && std::string(argv[4]) == "live")) {
+    std::cerr << "usage: basalt_runner DATASET_DIR CONFIG_JSON TRAJECTORY_CSV [live]\n";
     return 2;
   }
   const std::string dataset = argv[1], config = argv[2], trajectory = argv[3];
+  const bool live = argc == 5;
+  using Clock = std::chrono::steady_clock;
+  auto seconds = [](Clock::duration d) { return std::chrono::duration<double>(d).count(); };
 
   auto imu = read_imu(dataset + "/mav0/imu0/data.csv");
   std::vector<std::vector<Frame>> cams = {read_frames(dataset + "/mav0/cam0"), read_frames(dataset + "/mav0/cam1")};
@@ -83,6 +92,19 @@ int main(int argc, char **argv) {
   }
   std::cout << imu.size() << " IMU samples, " << cams[0].size() << " stereo frames\n";
 
+  const auto decode_start = Clock::now();
+  std::vector<std::vector<cv::Mat>> images(2);
+  for (uint32_t cam = 0; cam < 2; cam++) {
+    for (const auto &frame : cams[cam]) {
+      images[cam].push_back(cv::imread(frame.file, cv::IMREAD_GRAYSCALE));
+      if (images[cam].back().empty()) {
+        std::cerr << "can't read " << frame.file << "\n";
+        return 1;
+      }
+    }
+  }
+  std::printf("decoded in %.1f s\n", seconds(Clock::now() - decode_start));
+
   // Basalt's unified config: where its calibration and VIO settings are.
   const std::string unified = trajectory + ".toml";
   {
@@ -90,7 +112,7 @@ int main(int argc, char **argv) {
     toml << "show-gui=0\n"
          << "cam-calib=\"" << dataset << "/calib.json\"\n"
          << "config-path=\"" << config << "\"\n"
-         << "deterministic=1\n"
+         << "deterministic=" << (live ? 0 : 1) << "\n"
          << "num-threads=0\n";
   }
 
@@ -105,12 +127,15 @@ int main(int argc, char **argv) {
   std::ofstream out(trajectory);
   out << "#t_ns,px,py,pz,qx,qy,qz,qw\n";
   std::vector<vit_pose_data_t> poses;
+  std::map<int64_t, Clock::time_point> pushed;  // frame timestamp → when it was pushed
+  std::vector<double> latencies;                // seconds, frame push to pose out
   auto drain = [&] {
     vit_pose_t *pose = nullptr;
     while (vit_tracker_pop_pose(tracker, &pose) == VIT_SUCCESS && pose != nullptr) {
       vit_pose_data_t d;
       if (vit_pose_get_data(pose, &d) == VIT_SUCCESS) {
         poses.push_back(d);
+        if (auto it = pushed.find(d.timestamp); it != pushed.end()) latencies.push_back(seconds(Clock::now() - it->second));
         if (d.timestamp >= next_report) {
           next_report = d.timestamp + 1'000'000'000;
           std::printf("t=%6.1f s  pos (%+.2f %+.2f %+.2f)", (d.timestamp - poses.front().timestamp) / 1e9, d.px, d.py, d.pz);
@@ -135,8 +160,13 @@ int main(int argc, char **argv) {
   };
 
   size_t next_imu = 0;
+  const auto run_start = Clock::now();
   for (size_t f = 0; f < cams[0].size(); f++) {
     const int64_t t = cams[0][f].t;
+    if (live) {
+      // As a camera would: this frame no sooner than its time after the first.
+      std::this_thread::sleep_until(run_start + std::chrono::nanoseconds(t - cams[0][0].t));
+    }
     // Basalt integrates IMU up to the first sample after a frame, and in deterministic mode waits
     // for each frame to come out: give it the samples just past the frame first.
     for (; next_imu < imu.size() && imu[next_imu].t <= t + 20000000; next_imu++) {
@@ -144,12 +174,9 @@ int main(int argc, char **argv) {
       vit_imu_sample_t sample{s.t, s.a[0], s.a[1], s.a[2], s.w[0], s.w[1], s.w[2]};
       vit_tracker_push_imu_sample(tracker, &sample);
     }
+    pushed[t] = Clock::now();
     for (uint32_t cam = 0; cam < 2; cam++) {
-      cv::Mat image = cv::imread(cams[cam][f].file, cv::IMREAD_GRAYSCALE);
-      if (image.empty()) {
-        std::cerr << "can't read " << cams[cam][f].file << "\n";
-        return 1;
-      }
+      const cv::Mat &image = images[cam][f];
       vit_img_sample_t sample{};
       sample.cam_index = cam;
       sample.timestamp = cams[cam][f].t;
@@ -163,9 +190,34 @@ int main(int argc, char **argv) {
     }
     drain();
   }
+  if (live) {
+    // Let the pipeline finish what it has queued, then stop it.
+    for (int i = 0; i < 300 && poses.size() < cams[0].size(); i++) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      drain();
+    }
+  }
+  if (!live) drain();
+  // Not after stopping: the pipeline then queues an empty end-of-stream state that
+  // vit_tracker_pop_pose dereferences (crashes in live mode).
   vit_tracker_stop(tracker);
-  drain();
   vit_tracker_destroy(tracker);
+  const double elapsed = seconds(Clock::now() - run_start);
+  const double recorded = (cams[0].back().t - cams[0].front().t) / 1e9;
+  std::printf("tracking took %.1f s for %.1f s of frames (%.2fx real time)\n", elapsed, recorded, recorded / elapsed);
+  if (!latencies.empty()) {
+    auto sorted = latencies;
+    std::sort(sorted.begin(), sorted.end());
+    auto at = [&](double q) { return sorted[std::min(sorted.size() - 1, size_t(q * sorted.size()))] * 1000; };
+    const size_t tenth = std::max<size_t>(1, latencies.size() / 10);
+    double first = 0, last = 0;
+    for (size_t i = 0; i < tenth; i++) {
+      first += latencies[i];
+      last += latencies[latencies.size() - 1 - i];
+    }
+    std::printf("latency push→pose: median %.0f ms, 95%% %.0f ms; first tenth %.0f ms, last tenth %.0f ms\n", at(0.5),
+                at(0.95), first / tenth * 1000, last / tenth * 1000);
+  }
 
   if (poses.empty()) {
     std::cerr << "no poses\n";
