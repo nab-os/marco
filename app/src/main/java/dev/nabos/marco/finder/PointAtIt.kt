@@ -49,6 +49,7 @@ class PointAtIt(context: Context, private val scope: CoroutineScope, private val
         if (!sensor.available) return
         stop()
         sensor.start()
+        engine.fastPoll = true
         restartSweep()
         jobs += scope.launch { sensor.heading.collect(::onHeading) }
         jobs += scope.launch { engine.samples.collect(::onSample) }
@@ -65,6 +66,7 @@ class PointAtIt(context: Context, private val scope: CoroutineScope, private val
         jobs.forEach { it.cancel() }
         jobs.clear()
         sensor.stop()
+        engine.fastPoll = false
         lastHeading = null
         turnRate = 0.0
         _state.value = PointState(unsupported = !sensor.available)
@@ -84,13 +86,13 @@ class PointAtIt(context: Context, private val scope: CoroutineScope, private val
 
     private fun onSample(s: RssiSample) {
         if (_state.value.phase != PointPhase.SWEEPING) return
-        val h = lastHeading ?: return
+        val h = sensor.headingAt(s.atMs) ?: return
         // Advert and connection RSSI differ in level: start over if the source switches.
         if (fromConnection != null && fromConnection != s.fromConnection) restartSweep()
         fromConnection = s.fromConnection
         if (turnRate > MAX_TURN_DEG_PER_S) return // smeared across too many degrees to place
         sweep.add(h, s.rssi)
-        val done = sweep.coverage >= DONE_COVERAGE && sweep.samples >= DONE_SAMPLES
+        val done = sweep.coverage >= 1f && sweep.samples >= DONE_SAMPLES
         _state.update {
             it.copy(
                 phase = if (done) PointPhase.DONE else PointPhase.SWEEPING,
@@ -102,10 +104,9 @@ class PointAtIt(context: Context, private val scope: CoroutineScope, private val
     }
 
     companion object {
-        /** At 4 readings/s this still lands a reading in most 10° bins. */
-        const val MAX_TURN_DEG_PER_S = 45.0
+        /** At ~10 readings/s this still lands several readings in every 30° sector. */
+        const val MAX_TURN_DEG_PER_S = 90.0
         private const val RATE_SMOOTHING_S = 0.3
-        private const val DONE_COVERAGE = 0.95f
-        private const val DONE_SAMPLES = 50
+        private const val DONE_SAMPLES = 40
     }
 }

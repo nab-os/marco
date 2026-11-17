@@ -52,8 +52,11 @@ data class FinderState(
     val message: String? = null,
 )
 
-/** One unfiltered RSSI reading. Advert and connection readings aren't comparable. */
-data class RssiSample(val rssi: Int, val fromConnection: Boolean)
+/**
+ * One unfiltered RSSI reading, [atMs] on the [SystemClock.elapsedRealtime] clock
+ * when it was measured. Advert and connection readings aren't comparable.
+ */
+data class RssiSample(val rssi: Int, val fromConnection: Boolean, val atMs: Long)
 
 /**
  * Finder side: scans for one paired phone's rotating ID, connects over GATT to
@@ -72,6 +75,9 @@ class FinderEngine(private val context: Context, private val scope: CoroutineSco
     private val _samples = MutableSharedFlow<RssiSample>(extraBufferCapacity = 16, onBufferOverflow = BufferOverflow.DROP_OLDEST)
     /** Raw readings as they arrive, for "point at it" sweeps. */
     val samples: SharedFlow<RssiSample> = _samples.asSharedFlow()
+
+    /** Poll connection RSSI as fast as the link allows, for sweeps. */
+    var fastPoll = false
 
     private enum class Source { ADVERT, CONNECTION }
 
@@ -213,15 +219,16 @@ class FinderEngine(private val context: Context, private val scope: CoroutineSco
             val data = r.scanRecord?.getServiceData(serviceUuid) ?: return
             val device = r.device
             val rssi = r.rssi
-            scope.launch { onAdvert(device, data, rssi) }
+            val atMs = r.timestampNanos / 1_000_000
+            scope.launch { onAdvert(device, data, rssi, atMs) }
         }
     }
 
-    private fun onAdvert(device: BluetoothDevice, data: ByteArray, rssi: Int) {
+    private fun onAdvert(device: BluetoothDevice, data: ByteArray, rssi: Int, atMs: Long) {
         if (!_state.value.active) return
         if (!matchesPeer(data)) return
         lastDevice = device // the advertiser's random address rotates; always use the latest
-        if (link?.ready != true) feed(rssi, Source.ADVERT)
+        if (link?.ready != true) feed(rssi, Source.ADVERT, atMs)
         if (_state.value.phase == LinkPhase.SEARCHING) _state.update { it.copy(phase = LinkPhase.SEEN) }
         maybeConnect()
     }
@@ -265,8 +272,10 @@ class FinderEngine(private val context: Context, private val scope: CoroutineSco
         pollJob?.cancel()
         pollJob = scope.launch {
             while (isActive && link === l && l.ready) {
-                l.readRssi()?.let { feed(it, Source.CONNECTION) }
-                delay(RSSI_POLL_MS)
+                val asked = now()
+                // The reading is of a packet received while the request was in flight.
+                l.readRssi()?.let { feed(it, Source.CONNECTION, (asked + now()) / 2) }
+                delay(if (fastPoll) FAST_RSSI_POLL_MS else RSSI_POLL_MS)
             }
         }
         queuedOp?.let { op ->
@@ -325,8 +334,8 @@ class FinderEngine(private val context: Context, private val scope: CoroutineSco
 
     // --- signal processing ----------------------------------------------------------
 
-    private fun feed(rssi: Int, src: Source) {
-        _samples.tryEmit(RssiSample(rssi, src == Source.CONNECTION))
+    private fun feed(rssi: Int, src: Source, atMs: Long) {
+        _samples.tryEmit(RssiSample(rssi, src == Source.CONNECTION, atMs))
         // Advert and connection RSSI can use different TX power; don't blend them.
         if (src != source) {
             filter.reset()
@@ -401,6 +410,7 @@ class FinderEngine(private val context: Context, private val scope: CoroutineSco
         private const val TAG = "Marco.Finder"
 
         private const val RSSI_POLL_MS = 250L
+        private const val FAST_RSSI_POLL_MS = 60L
         private const val STALE_MS = 4_000L
         private const val CONNECT_TIMEOUT_MS = 10_000L
         private const val INITIAL_BACKOFF_MS = 1_000L

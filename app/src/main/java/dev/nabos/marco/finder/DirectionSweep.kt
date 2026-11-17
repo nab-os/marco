@@ -40,8 +40,15 @@ class DirectionSweep(
         count[b]++
     }
 
-    /** Fraction of the circle that has at least one sample, 0..1. */
-    val coverage: Float get() = count.count { it > 0 }.toFloat() / bins
+    /**
+     * Fraction of the circle's [SECTORS] that have a sample, 0..1. Coarser than
+     * the bins: the cosine fit needs readings all round, not in every bin.
+     */
+    val coverage: Float
+        get() {
+            val per = bins / SECTORS
+            return (0 until SECTORS).count { s -> (0 until per).any { count[s * per + it] > 0 } }.toFloat() / SECTORS
+        }
 
     val samples: Int get() = count.sum()
 
@@ -123,8 +130,9 @@ class DirectionSweep(
         ((normalize(headingDeg) + binDeg / 2) / binDeg).toInt() % bins
 
     companion object {
-        const val MIN_COVERAGE = 0.8f
-        const val MIN_SAMPLES = 30
+        const val SECTORS = 12
+        const val MIN_COVERAGE = 0.75f
+        const val MIN_SAMPLES = 20
         const val CLEAR_CONTRAST_DB = 3.0
 
         fun normalize(deg: Double): Double = ((deg % 360.0) + 360.0) % 360.0

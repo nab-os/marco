@@ -39,7 +39,9 @@ import kotlin.math.sin
 @Composable
 fun PointDial(s: PointState, modifier: Modifier) {
     val heading = s.heading ?: 0.0
-    val target = s.result?.takeIf { s.phase == PointPhase.DONE && it.clear }
+    // While still sweeping, show the estimate so far, faintly and without haptics.
+    val estimate = s.result?.takeIf { it.clear }
+    val target = estimate?.takeIf { s.phase == PointPhase.DONE }
     val facing = target != null && s.heading != null && DirectionSweep.isFacing(heading, target.headingDeg)
 
     val view = LocalView.current
@@ -48,7 +50,7 @@ fun PointDial(s: PointState, modifier: Modifier) {
     }
     // Animate the arrow by its offset from straight ahead, so it never spins the long way round.
     val arrowDeg by animateFloatAsState(
-        target?.let { DirectionSweep.delta(heading, it.headingDeg).toFloat() } ?: 0f, tween(120), label = "arrow",
+        estimate?.let { DirectionSweep.delta(heading, it.headingDeg).toFloat() } ?: 0f, tween(120), label = "arrow",
     )
 
     val ringColor = MaterialTheme.colorScheme.outlineVariant
@@ -91,9 +93,13 @@ fun PointDial(s: PointState, modifier: Modifier) {
             }
             drawPath(you, youColor)
 
-            if (target != null) {
+            if (estimate != null) {
                 rotate(arrowDeg, c) {
-                    val col = if (facing) HOT else lerp(COLD, HOT, 0.6f)
+                    val col = when {
+                        facing -> HOT
+                        target == null -> Color.Gray.copy(alpha = 0.5f)
+                        else -> lerp(COLD, HOT, 0.6f)
+                    }
                     drawLine(col, Offset(c.x, c.y - inner), Offset(c.x, c.y - maxR * 0.9f), strokeWidth = 10.dp.toPx(), cap = StrokeCap.Round)
                     val head = Path().apply {
                         moveTo(c.x, c.y - maxR)
@@ -104,7 +110,8 @@ fun PointDial(s: PointState, modifier: Modifier) {
                     drawPath(head, col)
                 }
                 if (facing) drawCircle(HOT.copy(alpha = 0.25f), radius = maxR, style = Stroke(10.dp.toPx()))
-            } else if (s.phase == PointPhase.SWEEPING) {
+            }
+            if (s.phase == PointPhase.SWEEPING) {
                 // Progress around the rim.
                 drawArc(
                     Color.Gray.copy(alpha = 0.6f), -90f, 360f * s.coverage, useCenter = false,
@@ -137,7 +144,7 @@ fun pointDetail(s: PointState): String {
     return when {
         s.unsupported -> "This phone can't tell which way it's facing."
         s.phase == PointPhase.SWEEPING ->
-            "Hold the phone against your chest and turn on the spot, a full circle in about 20 s. Your body blocks the signal from behind."
+            "Hold the phone against your chest and turn on the spot, a full circle in about 10 s. Your body blocks the signal from behind."
         r == null || !r.clear ->
             "The signal barely changed as you turned${r?.let { " (${it.contrastDb.roundToInt()} dB)" } ?: ""}. It may be very close, or bouncing off walls. Move a few steps and sweep again."
         else -> "Walk that way a few metres, then sweep again to refine. Signal ${r.contrastDb.roundToInt()} dB stronger than behind you."
