@@ -39,6 +39,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import dev.nabos.marco.vision.CalibrationBoard
+import dev.nabos.marco.vision.CalibrationPhase
 import dev.nabos.marco.vision.Calibrator
 import dev.nabos.marco.vision.Recorder
 import dev.nabos.marco.vision.Vernier
@@ -126,23 +127,55 @@ private fun CalibrateMode() {
             if (s.points >= 0) "Board read: ${s.points} points" else "Looking for the board…",
             style = MaterialTheme.typography.titleMedium,
         )
-        Text("Views kept: ${s.kept} / ${Calibrator.MAX_VIEWS} (need ${Calibrator.MIN_VIEWS})")
-        Text(
-            "Point this camera at the other phone's board from about 10–20 cm. Move slowly: tilt it every " +
-                "way, and slide it so the board visits every part of the frame, corners included.",
-            style = MaterialTheme.typography.bodySmall,
-        )
-        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            Button(calibrator::calibrate, enabled = s.kept >= Calibrator.MIN_VIEWS && !s.calibrating) {
-                Text(if (s.calibrating) "Calibrating…" else "Calibrate")
+        if (s.phase == CalibrationPhase.ALIGNING) {
+            Text("Poses: ${s.poses} (need ${Calibrator.MIN_POSES}, 40+ is better)")
+            Text(
+                "Keep the board in view and turn the phone about every axis, at a steady pace: tilt it " +
+                    "forward and back, left and right, and twist it. Pause now and then so frames stay sharp.",
+                style = MaterialTheme.typography.bodySmall,
+            )
+            Button(calibrator::align, enabled = s.poses >= Calibrator.MIN_POSES && !s.aligning) {
+                Text(if (s.aligning) "Aligning…" else "Align")
+            }
+        } else {
+            Text("Views kept: ${s.kept} / ${Calibrator.MAX_VIEWS} (need ${Calibrator.MIN_VIEWS})")
+            Text(
+                "Point this camera at the other phone's board from about 10–20 cm. Move slowly: tilt it every " +
+                    "way, and slide it so the board visits every part of the frame, corners included.",
+                style = MaterialTheme.typography.bodySmall,
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                Button(calibrator::calibrate, enabled = s.kept >= Calibrator.MIN_VIEWS && !s.calibrating) {
+                    Text(if (s.calibrating) "Calibrating…" else "Calibrate")
+                }
+                OutlinedButton(calibrator::startAlignment, enabled = s.result != null) { Text("Align gyroscope") }
             }
         }
         s.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+        s.alignment?.let { a ->
+            Text(
+                buildString {
+                    appendLine("Gyroscope alignment, ${a.pairs} frame pairs")
+                    appendLine("time offset   %+.1f ms (gyro later)".format(a.timeOffsetMs))
+                    appendLine("off square    %.2f°".format(a.offAxisDeg))
+                    appendLine("vs factory    ${a.vsFactoryDeg?.let { "%.2f°".format(it) } ?: "-"}")
+                    appendLine("residual      %.3f°".format(a.rmsDeg))
+                    appendLine("axis coverage %.2f${if (a.axisCoverage < 0.3) "  (turn more about every axis)" else ""}".format(a.axisCoverage))
+                    appendLine("gyro bias     ${a.gyroBias.joinToString(" ") { "%.4f".format(it) }} rad/s")
+                    append("Saved to ${a.savedTo.name}")
+                },
+                fontFamily = FontFamily.Monospace,
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
         s.result?.let { r ->
             val f = r.factory
             Text(
                 buildString {
-                    appendLine("${r.model}, ${r.views} views, rms %.3f px".format(r.rms))
+                    appendLine("${r.model}, ${r.views} views, rms %.3f px${if (r.saved) " (saved)" else ""}".format(r.rms))
+                    if (r.rmsByModel.size > 1) {
+                        appendLine("models: " + r.rmsByModel.entries.joinToString("  ") { (m, v) -> "%s %.3f".format(m, v) })
+                    }
                     appendLine("          vernier    factory")
                     appendLine("fx   %10.2f %10s".format(r.fx, f?.let { "%.2f".format(it.fx) } ?: "-"))
                     appendLine("fy   %10.2f %10s".format(r.fy, f?.let { "%.2f".format(it.fy) } ?: "-"))
