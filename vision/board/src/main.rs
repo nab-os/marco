@@ -20,8 +20,10 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
-/// Big enough for a phone's ultrawide to read from 30–50 cm on a ~110 dpi monitor.
-const DEFAULT_SQUARE_PX: u32 = 32;
+/// About 9 mm on a ~110 dpi monitor: a phone ultrawide at 30–50 cm sees squares of
+/// 5–8 measured pixels, read quickly (0.5 s a frame on a Pixel 7a, against 1.8 s for
+/// 4 px squares seen from close up) and fitted to 0.09 px.
+const DEFAULT_SQUARE_PX: u32 = 40;
 const MIN_SQUARE_PX: u32 = 8;
 
 /// A board rendered for one window size and square size, as 0RGB pixels.

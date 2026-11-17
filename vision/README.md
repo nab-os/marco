@@ -26,10 +26,10 @@ Debug builds add a **Marco Lab** launcher entry:
 A monitor makes a bigger board than a phone: it can fill a wide lens's whole frame, corners included, from 30–50 cm, closer to where a fixed-focus lens is sharp. The board's scale doesn't matter, but it must be shown one board pixel per screen pixel, which `marco-board` does at any window size:
 
 ```bash
-cargo run --release -p marco-board -- --square 32   # fullscreen; --windowed for a window
+cargo run --release -p marco-board                 # fullscreen; --square PX, --windowed
 ```
 
-It renders the board again whenever the window changes size, in the background, showing the previous one cropped (never scaled) meanwhile. `+` / `-` change the square size, `F` or F11 toggles fullscreen, `Q` or Esc quits. Each render prints the board's size in squares and the display's scale factor: with fractional scaling, check that the compositor isn't resampling the window. Pick squares that land around 10 pixels or more in the camera's image: about 32 px on a ~110 dpi monitor for a phone ultrawide at 40 cm.
+It renders the board again whenever the window changes size, in the background, showing the previous one cropped (never scaled) meanwhile. `+` / `-` change the square size, `F` or F11 toggles fullscreen, `Q` or Esc quits. Each render prints the board's size in squares and the display's scale factor: with fractional scaling, check that the compositor isn't resampling the window. The default, 40 px squares, suits a ~110 dpi monitor and a phone ultrawide at 30–50 cm: on a Pixel 7a it measured 0.5 s a frame and fitted 0.09 px, where 4 px squares seen from close up took 1.8 s a frame and fitted 0.23 px. The calibration screen shows how big the squares look to the camera and warns when they're too small or too big.
 
 ### From adb
 

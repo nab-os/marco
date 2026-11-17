@@ -126,7 +126,7 @@ pub fn align(orientations: &[CameraOrientation], gyro: &[GyroSample]) -> Result<
     let (rotation, cost) = fit(&pairs, &integrated, offset_s).ok_or(ImuError::NoGyro)?;
     let used = pairs.iter().filter(|pair| integrated.covers(pair, offset_s)).count();
 
-    let (time_offset_sd_ms, rotation_sd_deg) = bootstrap(&pairs, &integrated, offset_s, &rotation);
+    let (time_offset_sd_ms, rotation_sd_deg) = bootstrap(&pairs, frames.len(), &integrated, offset_s, &rotation);
 
     let quaternion = UnitQuaternion::from_rotation_matrix(&rotation);
     let q = quaternion.as_ref();
@@ -145,9 +145,13 @@ pub fn align(orientations: &[CameraOrientation], gyro: &[GyroSample]) -> Result<
     })
 }
 
-/// How much the offset and rotation move when the pairs are resampled with
+/// How much the offset and rotation move when the poses are resampled with
 /// replacement: an uncertainty from the run itself, without repeating it.
-fn bootstrap(pairs: &[Pair], integrated: &Integrated, offset_s: f64, rotation: &Rotation3<f64>) -> (f64, f64) {
+///
+/// Poses, not pairs: pairs share poses, so a pose read badly spoils several
+/// at once, and resampling pairs as if independent made the spread about
+/// three times too small against real repeated runs.
+fn bootstrap(pairs: &[Pair], poses: usize, integrated: &Integrated, offset_s: f64, rotation: &Rotation3<f64>) -> (f64, f64) {
     const ROUNDS: usize = 40;
     let mut seed = 0x9e37_79b9_7f4a_7c15u64;
     let mut next = move |bound: usize| {
@@ -156,7 +160,15 @@ fn bootstrap(pairs: &[Pair], integrated: &Integrated, offset_s: f64, rotation: &
     };
     let (mut offsets, mut angles) = (Vec::new(), Vec::new());
     for _ in 0..ROUNDS {
-        let sample: Vec<Pair> = (0..pairs.len()).map(|_| pairs[next(pairs.len())].clone()).collect();
+        // Each pose drawn k times; a pair counts once per draw of each end.
+        let mut drawn = vec![0usize; poses];
+        for _ in 0..poses {
+            drawn[next(poses)] += 1;
+        }
+        let sample: Vec<Pair> = pairs
+            .iter()
+            .flat_map(|pair| std::iter::repeat_n(pair.clone(), drawn[pair.first] * drawn[pair.second]))
+            .collect();
         let offset = golden(offset_s - 0.01, offset_s + 0.01, |offset| {
             fit(&sample, integrated, offset).map_or(f64::INFINITY, |(_, cost)| cost)
         });
@@ -177,6 +189,9 @@ fn bootstrap(pairs: &[Pair], integrated: &Integrated, offset_s: f64, rotation: &
 /// Two measured frames and how the camera turned between them.
 #[derive(Clone)]
 struct Pair {
+    /// The two poses, as indices in time order.
+    first: usize,
+    second: usize,
     t0_s: f64,
     t1_s: f64,
     /// Rotation vector of the camera's turn, in camera axes at the first frame.
@@ -186,7 +201,7 @@ struct Pair {
 fn pairs(frames: &[CameraOrientation]) -> Vec<Pair> {
     let mut pairs = Vec::new();
     for (i, first) in frames.iter().enumerate() {
-        for second in &frames[i + 1..] {
+        for (j, second) in frames.iter().enumerate().skip(i + 1) {
             let dt = (second.t_ns - first.t_ns) as f64 * 1e-9;
             if dt > PAIR_MAX_S {
                 break;
@@ -198,6 +213,8 @@ fn pairs(frames: &[CameraOrientation]) -> Vec<Pair> {
             let camera = turn.scaled_axis();
             if camera.norm().to_degrees() >= PAIR_MIN_DEG {
                 pairs.push(Pair {
+                    first: i,
+                    second: j,
                     t0_s: first.t_ns as f64 * 1e-9,
                     t1_s: second.t_ns as f64 * 1e-9,
                     camera,
