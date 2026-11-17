@@ -12,7 +12,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JFloatArray, JLongArray};
 use jni::sys::{jboolean, jbyteArray, jdouble, jint, jintArray, jlong, jstring};
-use nalgebra::{Matrix3, Vector3};
+use nalgebra::{Matrix3, UnitQuaternion, Vector3};
 use serde::Serialize;
 use vernier_camera::geometry::homography;
 use vernier_camera::{
@@ -110,6 +110,8 @@ pub struct Session {
     gyro: Vec<GyroSample>,
     /// Which cells of the frame the kept views' points have visited.
     covered: [bool; COVER_COLUMNS * COVER_ROWS],
+    /// The lens, once [`Session::finish`] has calibrated it.
+    camera: Option<Camera>,
     /// Side of a board square in the last frame read, binned pixels.
     square_px: f64,
 }
@@ -117,6 +119,8 @@ pub struct Session {
 /// A measured frame, stamped at the middle of the exposure of the board's
 /// average row (rows expose one after another: a rolling shutter).
 struct TimedView {
+    /// The sensor's own timestamp, to pair it with the other lens's frame.
+    sensor_ns: i64,
     t_ns: i64,
     view: View,
 }
@@ -152,6 +156,7 @@ impl Session {
             gyro: Vec::new(),
             covered: [false; COVER_COLUMNS * COVER_ROWS],
             square_px: 0.0,
+            camera: None,
         }
     }
 
@@ -182,6 +187,7 @@ impl Session {
         let mean_row = view.points.iter().map(|point| point.pixel[1]).sum::<f64>() / view.points.len() as f64;
         let row_delay = rolling_shutter_skew_ns as f64 * mean_row / view.height as f64;
         self.frames.push(TimedView {
+            sensor_ns: t_ns,
             t_ns: t_ns + exposure_ns / 2 + row_delay as i64,
             view: view.clone(),
         });
@@ -333,8 +339,9 @@ impl Session {
     /// Calibrates the lens, then solves every measured frame's pose with it
     /// and aligns those poses with the gyroscope. The alignment can fail on
     /// its own (too little turning, no gyroscope) without losing the lens.
-    pub fn finish(&self) -> Result<Finished, CalibrationError> {
+    pub fn finish(&mut self) -> Result<Finished, CalibrationError> {
         let (calibration, fits) = self.calibrate_best()?;
+        self.camera = Some(calibration.camera.clone());
         let orientations: Vec<CameraOrientation> = self
             .frames
             .iter()
@@ -395,6 +402,74 @@ pub fn sane_to_corners(camera: &Camera) -> bool {
         false
     })
 }
+
+/// How a second lens sits relative to the first, from frames where both
+/// read the board at the same instant.
+#[derive(Clone, Debug, Serialize)]
+pub struct StereoPose {
+    /// Takes the first lens's camera axes to the second's, `x, y, z, w`.
+    pub second_from_first_xyzw: [f64; 4],
+    /// The first lens's centre seen from the second, in board squares: the
+    /// board's real size is unknown, so only its direction is metric-free.
+    pub translation_squares: [f64; 3],
+    pub pairs: usize,
+    /// RMS angle of the pairs around the averaged rotation, degrees.
+    pub rotation_sd_deg: f64,
+    /// RMS distance of the pairs around the median translation, squares.
+    pub translation_sd_squares: f64,
+}
+
+/// Pairs the two sessions' frames by sensor timestamp, solves both lenses'
+/// poses on each pair, and averages the second lens's pose relative to the
+/// first. `None` with fewer than [`MIN_STEREO_PAIRS`] good pairs.
+pub fn stereo_pose(first: &Session, first_camera: &Camera, second: &Session, second_camera: &Camera) -> Option<StereoPose> {
+    let mut relative = Vec::new();
+    for a in &first.frames {
+        let Some(b) = second.frames.iter().find(|b| b.sensor_ns == a.sensor_ns) else {
+            continue;
+        };
+        let (Ok(fa), Ok(fb)) = (solve_pnp(first_camera, &a.view), solve_pnp(second_camera, &b.view)) else {
+            continue;
+        };
+        if fa.rms > MAX_POSE_RMS || fb.rms > MAX_POSE_RMS {
+            continue;
+        }
+        // x_a = Ra x + ta, x_b = Rb x + tb  ⇒  x_b = Rb Raᵀ (x_a − ta) + tb.
+        let rotation = fb.pose.rotation * fa.pose.rotation.inverse();
+        let translation = fb.pose.translation - rotation * fa.pose.translation;
+        relative.push((UnitQuaternion::from_rotation_matrix(&rotation), translation));
+    }
+    if relative.len() < MIN_STEREO_PAIRS {
+        return None;
+    }
+    // Quaternions on the same hemisphere, summed and normalised: fine for the
+    // small spread of one rigid rig.
+    let reference = relative[0].0;
+    let sum = relative.iter().fold(nalgebra::Vector4::zeros(), |sum, (q, _)| {
+        let v = q.as_ref().coords;
+        sum + if v.dot(&reference.as_ref().coords) < 0.0 { -v } else { v }
+    });
+    let mean = UnitQuaternion::from_quaternion(nalgebra::Quaternion::from(sum));
+    let median = |axis: usize| {
+        let mut values: Vec<f64> = relative.iter().map(|(_, t)| t[axis]).collect();
+        values.sort_by(f64::total_cmp);
+        values[values.len() / 2]
+    };
+    let translation = Vector3::new(median(0), median(1), median(2));
+    let count = relative.len() as f64;
+    let rotation_sd = (relative.iter().map(|(q, _)| q.angle_to(&mean).powi(2)).sum::<f64>() / count).sqrt();
+    let translation_sd = (relative.iter().map(|(_, t)| (t - translation).norm_squared()).sum::<f64>() / count).sqrt();
+    let q = mean.as_ref();
+    Some(StereoPose {
+        second_from_first_xyzw: [q.i, q.j, q.k, q.w],
+        translation_squares: [translation.x, translation.y, translation.z],
+        pairs: relative.len(),
+        rotation_sd_deg: rotation_sd.to_degrees(),
+        translation_sd_squares: translation_sd,
+    })
+}
+
+pub const MIN_STEREO_PAIRS: usize = 5;
 
 /// What [`Session::finish`] found.
 pub struct Finished {
@@ -703,6 +778,28 @@ pub extern "system" fn Java_dev_nabos_marco_vision_Vernier_finish(
         .map_or(std::ptr::null_mut(), |string| string.into_raw())
 }
 
+/// The second session's lens relative to the first's, as a [`StereoPose`] in
+/// JSON, or `{"error": ...}`. Both sessions must have been finished.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_nabos_marco_vision_Vernier_stereo(
+    env: JNIEnv,
+    _class: JClass,
+    first: jlong,
+    second: jlong,
+) -> jstring {
+    let json = guarded(error_json("stereo crashed"), || {
+        let (a, b) = unsafe { (session(first), session(second)) };
+        match (a.camera.clone(), b.camera.clone()) {
+            (Some(camera_a), Some(camera_b)) => match stereo_pose(a, &camera_a, b, &camera_b) {
+                Some(pose) => serde_json::to_string(&pose).unwrap_or_else(|e| error_json(&e.to_string())),
+                None => error_json(&format!("fewer than {MIN_STEREO_PAIRS} frames where both lenses read the board")),
+            },
+            _ => error_json("both lenses must be calibrated first"),
+        }
+    });
+    env.new_string(json).map_or(std::ptr::null_mut(), |string| string.into_raw())
+}
+
 fn error_json(message: &str) -> String {
     serde_json::json!({ "error": message }).to_string()
 }
@@ -942,5 +1039,41 @@ mod tests {
         let mut fisheye = Camera::ideal(Model::Fisheye, 640, 480, 330.0, 331.0, 318.0, 243.0);
         fisheye.distortion = vec![0.02, -0.01, 0.003, -0.0008];
         assert!(sane_to_corners(&fisheye), "a well-behaved fisheye passes");
+    }
+
+    /// An ultrawide and a main lens 13 mm apart (about 1.5 squares here),
+    /// filming the same board: their relative pose comes back from paired frames.
+    #[test]
+    fn finds_the_second_lens() {
+        let mut wide = Camera::ideal(Model::Fisheye, 640, 480, 250.0, 250.0, 322.0, 238.0);
+        wide.distortion = vec![0.3, 0.1, 0.0, 0.0];
+        let mut main = Camera::ideal(Model::Pinhole, 320, 240, 236.0, 236.0, 160.0, 121.0);
+        main.distortion = vec![0.08, -0.15, 0.0, 0.0, 0.1];
+        let truth_rotation = Rotation3::from_scaled_axis(Vector3::new(0.004, -0.01, 0.006));
+        let truth_translation = Vector3::new(-1.5, 0.02, 0.1);
+        let board = target();
+        let scene = |camera| Scene { camera, target: &board, half_size: [40.0, 22.5], background: 0.05, supersample: 1 };
+        let (scene_wide, scene_main) = (scene(&wide), scene(&main));
+        let mut first = Session::new(Response::Linear, 1);
+        let mut second = Session::new(Response::Linear, 1);
+        for k in 0..8 {
+            let a = k as f64 * 0.8;
+            let pose = RigidPose::from_vectors(
+                Vector3::new(0.25 * a.sin(), 0.25 * (1.3 * a).cos(), 0.4 * (0.7 * a).sin()),
+                Vector3::new(4.0 * a.cos(), 3.0 * a.sin(), 34.0),
+            );
+            let seen_by_main = RigidPose { rotation: truth_rotation * pose.rotation, translation: truth_rotation * pose.translation + truth_translation };
+            let t = k as i64 * 33_000_000;
+            first.measure(&luma(&scene_wide, &pose), 640, 480, 640, t, 0, 0);
+            second.measure(&luma(&scene_main, &seen_by_main), 320, 240, 320, t, 0, 0);
+        }
+        let found = stereo_pose(&first, &wide, &second, &main).expect("pairs");
+        let q = found.second_from_first_xyzw;
+        let rotation = UnitQuaternion::from_quaternion(nalgebra::Quaternion::new(q[3], q[0], q[1], q[2]));
+        let error = (rotation.to_rotation_matrix().inverse() * truth_rotation).angle().to_degrees();
+        assert!(error < 0.1, "rotation off by {error}°");
+        let offset = (Vector3::from(found.translation_squares) - truth_translation).norm();
+        assert!(offset < 0.1, "translation off by {offset} squares: {:?}", found.translation_squares);
+        assert!(found.pairs >= 6, "{} pairs", found.pairs);
     }
 }

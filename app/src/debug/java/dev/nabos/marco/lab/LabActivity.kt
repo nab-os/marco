@@ -144,7 +144,8 @@ private fun CalibrateMode() {
                 when {
                     s.finishing -> "Calibrating…"
                     s.points < 0 -> "Looking for the board…"
-                    else -> "views ${s.views}/${Calibrator.READY_VIEWS} · frame %d%%/%d%% · poses ${s.poses}/${Calibrator.READY_POSES}"
+                    else -> ("views ${s.views}/${Calibrator.READY_VIEWS} · frame %d%%/%d%% · poses ${s.poses}/${Calibrator.READY_POSES}" +
+                        if (s.stereo) "\nlens 2 views ${s.secondViews}/${Calibrator.READY_VIEWS} · both ${s.bothRead}/${Calibrator.READY_BOTH}" else "")
                         .format((s.covered * 100).roundToInt(), (Calibrator.READY_COVERAGE * 100).roundToInt())
                 },
                 style = MaterialTheme.typography.titleMedium,
@@ -189,6 +190,11 @@ private fun CalibrateMode() {
                     } else {
                         appendLine("No gyroscope alignment: ${r.alignmentError ?: "no gyroscope"}")
                     }
+                    r.second?.let { b ->
+                        appendLine("Second lens ${b.label}: ${b.model}, fx %.1f, ${b.views} views, rms %.3f px".format(b.fx, b.rms))
+                        appendLine("  ${b.pairs} pairs, axes %.2f° apart ± %.2f°, baseline ${b.baselineM?.let { "%.1f mm".format(it * 1000) } ?: "unknown"}".format(b.angleDeg, b.rotationSdDeg))
+                    }
+                    r.stereoError?.let { appendLine("No stereo: $it") }
                     appendLine()
                     val f = r.factory
                     appendLine("${r.model}, ${r.views} views, rms %.3f px".format(r.rms))

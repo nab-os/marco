@@ -71,14 +71,35 @@ class CameraRig(context: Context) {
     /** `0`, or `0/2` for lens 2 of logical camera 0. */
     val label: String get() = listOfNotNull(cameraId, physicalId).joinToString("/")
 
+    /**
+     * Another lens of the same logical camera that can stream alongside [physicalId], for stereo:
+     * the widest of the others. Null if the camera has no other lens.
+     */
+    val secondId: String? = choice?.takeIf { it.physicalId != null }?.let { chosen ->
+        val logical = manager.getCameraCharacteristics(chosen.openId)
+        logical.physicalCameraIds
+            .filter { it != chosen.physicalId }
+            .map { it to manager.getCameraCharacteristics(it) }
+            .filter { (_, c) -> !c.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)?.getOutputSizes(ImageFormat.YUV_420_888).isNullOrEmpty() }
+            .minByOrNull { (_, c) -> c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.minOrNull() ?: Float.MAX_VALUE }
+            ?.first
+    }
+    val secondCharacteristics: CameraCharacteristics? = secondId?.let { manager.getCameraCharacteristics(it) }
+    val secondLabel: String? get() = secondId?.let { "$cameraId/$it" }
+
     private var thread: HandlerThread? = null
     private var device: CameraDevice? = null
     private var session: CameraCaptureSession? = null
-    private var reader: ImageReader? = null
+    private val readers = mutableListOf<ImageReader>()
 
     /** Picks the size to capture at: the largest of [aspect] no wider than [maxWidth]. */
-    fun outputSize(maxWidth: Int, aspect: Double = 4.0 / 3.0): Size? {
-        val sizes = characteristics?.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+    fun outputSize(maxWidth: Int, aspect: Double = 4.0 / 3.0): Size? = sizeOf(characteristics, maxWidth, aspect)
+
+    /** [outputSize] for the [secondId] lens. */
+    fun secondOutputSize(maxWidth: Int, aspect: Double = 4.0 / 3.0): Size? = sizeOf(secondCharacteristics, maxWidth, aspect)
+
+    private fun sizeOf(chars: CameraCharacteristics?, maxWidth: Int, aspect: Double): Size? {
+        val sizes = chars?.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
             ?.getOutputSizes(ImageFormat.YUV_420_888) ?: return null
         return sizes.filter { it.width <= maxWidth && abs(it.width.toDouble() / it.height - aspect) < 0.01 }
             .maxByOrNull { it.width }
@@ -102,72 +123,112 @@ class CameraRig(context: Context) {
         onInfo: (FrameInfo) -> Unit = {},
         onError: (String) -> Unit,
         exposureEv: Double = 0.0,
+    ) = startLenses(listOf(size), { _, frame -> onFrame(frame) }, { _, info -> onInfo(info) }, onError, exposureEv)
+
+    /**
+     * Streams [physicalId] at `sizes[0]` and, if a second size is given, [secondId] at `sizes[1]`,
+     * in one session: frames of both lenses from the same capture share a timestamp. Callbacks get
+     * the lens index (0 or 1) and run on the camera's own thread.
+     */
+    fun startLenses(
+        sizes: List<Size>,
+        onFrame: (Int, LumaFrame) -> Unit,
+        onInfo: (Int, FrameInfo) -> Unit = { _, _ -> },
+        onError: (String) -> Unit,
+        exposureEv: Double = 0.0,
     ) {
         val id = cameraId ?: return onError("No usable back camera")
-        val chars = characteristics!!
+        val lenses = listOf(physicalId, secondId).take(sizes.size)
+        val chars = listOf(characteristics!!, secondCharacteristics).take(sizes.size)
+        if (sizes.size > 1 && (lenses[1] == null || chars[1] == null)) return onError("This camera has no second lens")
         val t = HandlerThread("marco-camera").also { it.start() }
         thread = t
         val handler = Handler(t.looper)
         val executor = Executor { handler.post(it) }
 
-        val r = ImageReader.newInstance(size.width, size.height, ImageFormat.YUV_420_888, 3)
-        reader = r
-        r.setOnImageAvailableListener({ ir ->
-            val image = ir.acquireLatestImage() ?: return@setOnImageAvailableListener
-            try {
-                val plane = image.planes[0]
-                val w = image.width
-                val h = image.height
-                val luma = ByteArray(w * h)
-                val buffer = plane.buffer
-                val stride = plane.rowStride
-                for (row in 0 until h) {
-                    buffer.position(row * stride)
-                    buffer.get(luma, row * w, w)
+        sizes.forEachIndexed { index, size ->
+            val r = ImageReader.newInstance(size.width, size.height, ImageFormat.YUV_420_888, 3)
+            readers += r
+            r.setOnImageAvailableListener({ ir ->
+                val image = ir.acquireLatestImage() ?: return@setOnImageAvailableListener
+                try {
+                    val plane = image.planes[0]
+                    val w = image.width
+                    val h = image.height
+                    val luma = ByteArray(w * h)
+                    val buffer = plane.buffer
+                    val stride = plane.rowStride
+                    for (row in 0 until h) {
+                        buffer.position(row * stride)
+                        buffer.get(luma, row * w, w)
+                    }
+                    onFrame(index, LumaFrame(luma, w, h, image.timestamp))
+                } finally {
+                    image.close()
                 }
-                onFrame(LumaFrame(luma, w, h, image.timestamp))
-            } finally {
-                image.close()
-            }
-        }, handler)
+            }, handler)
+        }
 
+        // Throws, rather than calling back, when the camera is refused outright (from the background, say).
+        runCatching { openLenses(id, lenses, chars, executor, handler, exposureEv, onInfo, onError) }
+            .onFailure { onError("Camera unavailable: ${it.message}") }
+    }
+
+    private fun openLenses(
+        id: String,
+        lenses: List<String?>,
+        chars: List<CameraCharacteristics?>,
+        executor: Executor,
+        handler: Handler,
+        exposureEv: Double,
+        onInfo: (Int, FrameInfo) -> Unit,
+        onError: (String) -> Unit,
+    ) {
         manager.openCamera(id, executor, object : CameraDevice.StateCallback() {
             override fun onOpened(camera: CameraDevice) {
                 device = camera
-                val lens = physicalId
+                val physical = lenses.filterNotNull().toSet()
                 val request = (
-                    if (lens != null) camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD, setOf(lens))
+                    if (physical.isNotEmpty()) camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD, physical)
                     else camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
                     ).apply {
-                    addTarget(r.surface)
-                    configureForMeasuring(chars, lens, exposureEv)
+                    readers.forEach { addTarget(it.surface) }
+                    lenses.forEachIndexed { i, lens -> configureForMeasuring(chars[i]!!, lens, exposureEv) }
                 }
-                val output = OutputConfiguration(r.surface).apply { lens?.let { setPhysicalCameraId(it) } }
+                val outputs = readers.mapIndexed { i, r -> OutputConfiguration(r.surface).apply { lenses[i]?.let { setPhysicalCameraId(it) } } }
                 val config = SessionConfiguration(
                     SessionConfiguration.SESSION_REGULAR,
-                    listOf(output),
+                    outputs,
                     executor,
                     object : CameraCaptureSession.StateCallback() {
                         override fun onConfigured(s: CameraCaptureSession) {
                             session = s
                             s.setRepeatingRequest(request.build(), object : CameraCaptureSession.CaptureCallback() {
                                 override fun onCaptureCompleted(s: CameraCaptureSession, req: CaptureRequest, total: TotalCaptureResult) {
-                                    val result = lens?.let { total.physicalCameraTotalResults[it] } ?: total
-                                    onInfo(
-                                        FrameInfo(
-                                            timestampNs = result.get(CaptureResult.SENSOR_TIMESTAMP) ?: return,
-                                            exposureNs = result.get(CaptureResult.SENSOR_EXPOSURE_TIME),
-                                            rollingShutterSkewNs = result.get(CaptureResult.SENSOR_ROLLING_SHUTTER_SKEW),
-                                            frameDurationNs = result.get(CaptureResult.SENSOR_FRAME_DURATION),
-                                            focusDiopters = result.get(CaptureResult.LENS_FOCUS_DISTANCE),
+                                    lenses.forEachIndexed { i, lens ->
+                                        val result = lens?.let { total.physicalCameraTotalResults[it] } ?: total
+                                        onInfo(
+                                            i,
+                                            FrameInfo(
+                                                timestampNs = result.get(CaptureResult.SENSOR_TIMESTAMP) ?: return@forEachIndexed,
+                                                exposureNs = result.get(CaptureResult.SENSOR_EXPOSURE_TIME),
+                                                rollingShutterSkewNs = result.get(CaptureResult.SENSOR_ROLLING_SHUTTER_SKEW),
+                                                frameDurationNs = result.get(CaptureResult.SENSOR_FRAME_DURATION),
+                                                focusDiopters = result.get(CaptureResult.LENS_FOCUS_DISTANCE),
+                                            ),
                                         )
-                                    )
+                                    }
                                 }
                             }, handler)
                         }
 
-                        override fun onConfigureFailed(s: CameraCaptureSession) =
-                            onError(if (lens != null) "Camera $label can't stream on its own on this phone" else "Camera session failed")
+                        override fun onConfigureFailed(s: CameraCaptureSession) = onError(
+                            when {
+                                lenses.size > 1 -> "This phone can't stream camera $label and its second lens together"
+                                lenses[0] != null -> "Camera $label can't stream on its own on this phone"
+                                else -> "Camera session failed"
+                            },
+                        )
                     },
                 )
                 camera.createCaptureSession(config)
@@ -188,12 +249,12 @@ class CameraRig(context: Context) {
     fun stop() {
         runCatching { session?.close() }
         runCatching { device?.close() }
-        runCatching { reader?.close() }
+        readers.forEach { runCatching { it.close() } }
         // Let callbacks already queued finish, so callers can close what they write to.
         thread?.let { it.quitSafely(); it.join(1_000) }
         session = null
         device = null
-        reader = null
+        readers.clear()
         thread = null
     }
 
@@ -269,8 +330,8 @@ class CameraRig(context: Context) {
     private fun CameraCharacteristics.ints(key: CameraCharacteristics.Key<IntArray>): IntArray = get(key) ?: IntArray(0)
 
     /** Factory intrinsics mapped onto a [size] stream, for comparing with a calibration. */
-    fun factoryIntrinsics(size: Size): FactoryIntrinsics? {
-        val chars = characteristics ?: return null
+    fun factoryIntrinsics(size: Size, chars: CameraCharacteristics? = characteristics): FactoryIntrinsics? {
+        chars ?: return null
         val k = chars.get(CameraCharacteristics.LENS_INTRINSIC_CALIBRATION) ?: return null
         val pre = chars.get(CameraCharacteristics.SENSOR_INFO_PRE_CORRECTION_ACTIVE_ARRAY_SIZE) ?: return null
         if (k[0] <= 0f) return null

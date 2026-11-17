@@ -51,4 +51,11 @@ object Vernier {
      * imu_error}` or `{error}` if the lens couldn't be calibrated.
      */
     @JvmStatic external fun finish(handle: Long): String
+
+    /**
+     * How the [second] session's lens sits relative to the [first]'s, from frames where both read
+     * the board at the same timestamp; both must have been [finish]ed. JSON: `{second_from_first_xyzw,
+     * translation_squares, pairs, rotation_sd_deg, translation_sd_squares}` or `{error}`.
+     */
+    @JvmStatic external fun stereo(first: Long, second: Long): String
 }
