@@ -37,10 +37,22 @@ class MapReplay {
         }
         for ((variant, tuning) in variants) {
         val misses = mutableListOf<Double>()
+        val endErrors = mutableListOf<Double>()
+        val approachErrors = mutableListOf<Double>()
         for (path in paths.split(':')) {
             val rows = File(path).readLines().drop(1).map { it.split(',') }.filter { it.size == 8 }
             if (rows.size < 20) continue
             val map = SignalMap(tuning)
+            // Ground truth when the search ends standing still (under 0.2 m in the last 3 s): the phone is there.
+            val tEnd = rows.last()[0].toLong()
+            val lastRows = rows.filter { it[0].toLong() >= tEnd - 3_000 }
+            val still = lastRows.size >= 5 &&
+                (lastRows.maxOf { it[1].toDouble() } - lastRows.minOf { it[1].toDouble() }) < 0.2 &&
+                (lastRows.maxOf { it[2].toDouble() } - lastRows.minOf { it[2].toDouble() }) < 0.2
+            val truth = if (still) lastRows.map { it[1].toDouble() }.average() to lastRows.map { it[2].toDouble() }.average() else null
+            // The last moment the walker was still over 1.5 m from the phone: the estimate then is the honest one.
+            val approachT = truth?.let { (tx, ty) -> rows.lastOrNull { hypot(it[1].toDouble() - tx, it[2].toDouble() - ty) > 1.5 }?.get(0)?.toLong() }
+            var approachError: Double? = null
             val t0 = rows.first()[0].toLong()
             var next = 1_000L
             var moved = 0.0
@@ -56,6 +68,9 @@ class MapReplay {
                 next += 1_000
                 val e = map.estimate() ?: continue
                 val shown = e.x to e.y
+                if (truth != null && approachT != null && approachError == null && r[0].toLong() >= approachT) {
+                    approachError = hypot(e.x - truth.first, e.y - truth.second)
+                }
                 val top = e.probability.indices.maxBy { e.probability[it] }
                 val peakX = e.originX + (top % e.cols) * e.cellM
                 val peakY = e.originY + (top / e.cols) * e.cellM
@@ -101,13 +116,19 @@ class MapReplay {
             val ty = strongest.map { rows[it][2].toDouble() }.average()
             val e = map.estimate()!!
             misses += hypot(e.x - tx, e.y - ty)
-            println("REPLAY-END $variant ${File(path).name}: dot to strongest %.1f m, within %.1f m, n %.1f, body %.0f dB".format(misses.last(), e.spreadM, e.exponent, e.bodyDb))
+            val truthNote = truth?.let { (px, py) ->
+                endErrors += hypot(e.x - px, e.y - py)
+                approachError?.let { approachErrors += it }
+                " · TRUTH: end error %.1f m, before the approach %s".format(endErrors.last(), approachError?.let { "%.1f m".format(it) } ?: "n/a")
+            } ?: ""
+            println("REPLAY-END $variant ${File(path).name}: dot to strongest %.1f m, within %.1f m, n %.1f, body %.0f dB$truthNote".format(misses.last(), e.spreadM, e.exponent, e.bodyDb))
             println(
                 "REPLAY ${File(path).name}: shown spot moved %.1f m while shown, %d jumps over 0.5 m; off the hottest cell %.2f m on average, %.2f m at worst; off the hot core's middle %.2f m on average, %.2f m at worst"
                     .format(moved, bigJumps, offPeak.average(), offPeak.max(), centreOffPeak.average(), centreOffPeak.max()),
             )
         }
-        println("REPLAY-VARIANT $variant: dot to strongest %.2f m on average, %.1f m at worst".format(misses.average(), misses.max()))
+        println("REPLAY-VARIANT $variant: dot to strongest %.2f m on average, %.1f m at worst".format(misses.average(), misses.max()) +
+            if (endErrors.isEmpty()) "" else " · against truth (%d searches): end %.2f m, before the approach %.2f m (worst %.1f m)".format(endErrors.size, endErrors.average(), approachErrors.average(), approachErrors.max()))
         }
     }
 }
