@@ -73,7 +73,7 @@ class LabActivity : ComponentActivity() {
     }
 }
 
-private enum class Mode { MENU, BOARD, CALIBRATE, RECORD }
+private enum class Mode { MENU, BOARD, CALIBRATE, RECORD, STEREO }
 
 @Composable
 private fun Lab(initial: Mode) {
@@ -89,6 +89,7 @@ private fun Lab(initial: Mode) {
         Mode.BOARD -> CalibrationBoard()
         Mode.CALIBRATE -> if (cameraOk) CalibrateMode() else NeedCamera { askCamera.launch(Manifest.permission.CAMERA) }
         Mode.RECORD -> if (cameraOk) RecordMode() else NeedCamera { askCamera.launch(Manifest.permission.CAMERA) }
+        Mode.STEREO -> if (cameraOk) StereoMode() else NeedCamera { askCamera.launch(Manifest.permission.CAMERA) }
         Mode.MENU -> Column(
             Modifier.safeDrawingPadding().padding(24.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
@@ -98,6 +99,7 @@ private fun Lab(initial: Mode) {
             Button({ mode = Mode.BOARD }, Modifier.fillMaxWidth(), enabled = Vernier.available) { Text("Show calibration board") }
             Button({ mode = Mode.CALIBRATE }, Modifier.fillMaxWidth(), enabled = Vernier.available) { Text("Calibrate this camera") }
             OutlinedButton({ mode = Mode.RECORD }, Modifier.fillMaxWidth()) { Text("Record camera + motion") }
+            OutlinedButton({ mode = Mode.STEREO }, Modifier.fillMaxWidth()) { Text("Stereo test") }
             Text(
                 "Show the board on one phone and calibrate on the other. Recordings and calibrations go to " +
                     "Android/data/dev.nabos.marco/files/. To record with the Bluetooth signal, use Record on the Find screen.",
@@ -223,6 +225,34 @@ private fun CoverageGrid(coverage: Coverage, modifier: Modifier) {
             if (!visited) drawRect(Color.Black.copy(alpha = 0.45f), topLeft, cell)
             drawRect(line.copy(alpha = 0.6f), topLeft, cell, style = Stroke(1.dp.toPx()))
         }
+    }
+}
+
+@Composable
+private fun StereoMode() {
+    val context = LocalContext.current
+    val probe = remember { StereoProbe(context.applicationContext) }
+    DisposableEffect(probe) {
+        probe.start()
+        onDispose { probe.stop() }
+    }
+    val s by probe.state.collectAsStateWithLifecycle()
+    Column(Modifier.safeDrawingPadding().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Text(s.lenses, style = MaterialTheme.typography.bodySmall)
+        Text("Both lenses at once: ${s.supported.ifEmpty { "…" }}")
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            s.previews.forEach { p ->
+                p?.let { Image(it, null, Modifier.weight(1f).aspectRatio(it.width.toFloat() / it.height)) }
+            }
+        }
+        Text(
+            buildString {
+                s.counts.indices.forEach { i -> appendLine("lens ${i + 1}: ${s.counts[i]} frames, %.1f fps".format(s.fps[i])) }
+                append("gap to nearest frame: median ${s.medianGapMs?.let { "%.2f".format(it) } ?: "-"} ms, max ${s.maxGapMs?.let { "%.2f".format(it) } ?: "-"} ms")
+            },
+            fontFamily = FontFamily.Monospace,
+        )
+        s.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
     }
 }
 
