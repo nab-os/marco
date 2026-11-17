@@ -34,7 +34,7 @@ fun SignalMapView(m: MapState, modifier: Modifier) {
     Canvas(modifier) {
         val here = m.here ?: return@Canvas
         val e = m.estimate
-        val reach = e?.let { hypot(it.x - here.x, it.y - here.y) + max(it.spreadM, 1.0) } ?: 0.0
+        val reach = e?.let { hypot(m.spotX - here.x, m.spotY - here.y) + it.spreadM } ?: 0.0
         val radiusM = (reach * 1.15).coerceIn(MIN_RADIUS_M, MAX_RADIUS_M).toFloat()
         val scalePx = size.minDimension / 2 / radiusM
         // The world drawn in metres around you, y flipped (screen y points down) and
@@ -60,8 +60,8 @@ fun SignalMapView(m: MapState, modifier: Modifier) {
                             drawPath(line, trail, style = Stroke(3.dp.toPx() / scalePx))
                         }
                         e?.let {
-                            val spot = local(it.x, it.y)
-                            drawCircle(HOT, max(it.spreadM, 0.3).toFloat(), spot, style = Stroke(2.dp.toPx() / scalePx))
+                            val spot = local(m.spotX, m.spotY)
+                            drawCircle(HOT, it.spreadM.toFloat(), spot, style = Stroke(2.dp.toPx() / scalePx))
                             drawCircle(HOT, 6.dp.toPx() / scalePx, spot)
                         }
                     }
@@ -99,8 +99,8 @@ fun mapHeadline(m: MapState): String {
     val here = m.here ?: return "Starting the cameras…"
     val e = m.estimate ?: return "Walk around"
     if (e.spreadM > UNSURE_M) return "Keep walking"
-    val dx = e.x - here.x
-    val dy = e.y - here.y
+    val dx = m.spotX - here.x
+    val dy = m.spotY - here.y
     val distance = hypot(dx, dy)
     if (distance < max(1.0, e.spreadM)) return "Right around here"
     return "≈ ${distance.roundToInt()} m ${direction(here.headingX.toDouble(), here.headingY.toDouble(), dx, dy)}"

@@ -38,7 +38,7 @@ class SignalMap {
     data class Reading(val x: Double, val y: Double, val headingX: Double, val headingY: Double, val rssi: Int, val fromConnection: Boolean)
 
     data class Estimate(
-        /** The most likely spot. */
+        /** The most likely spot: the middle of the likely area around the best cell. */
         val x: Double,
         val y: Double,
         /** The radius around that spot holding two thirds of the probability, metres: how sure it is. */
@@ -109,13 +109,13 @@ class SignalMap {
             bins.values.map(Bin::snapshot) to readings
         }
         if (readings < MIN_READINGS || list.size < MIN_BINS) return null
-        val minX = list.minOf { it.x } - MARGIN_M
-        val maxX = list.maxOf { it.x } + MARGIN_M
-        val minY = list.minOf { it.y } - MARGIN_M
-        val maxY = list.maxOf { it.y } + MARGIN_M
-        val cell = max(MIN_CELL_M, max(maxX - minX, maxY - minY) / MAX_CELLS)
-        val cols = ((maxX - minX) / cell).toInt() + 1
-        val rows = ((maxY - minY) / cell).toInt() + 1
+        val spanM = max(list.maxOf { it.x } - list.minOf { it.x }, list.maxOf { it.y } - list.minOf { it.y }) + 2 * MARGIN_M
+        // Cells on fixed multiples of their size: otherwise each spot shifts as the path grows.
+        val cell = MIN_CELL_M * kotlin.math.ceil(spanM / MAX_CELLS / MIN_CELL_M)
+        val minX = kotlin.math.floor((list.minOf { it.x } - MARGIN_M) / cell) * cell
+        val minY = kotlin.math.floor((list.minOf { it.y } - MARGIN_M) / cell) * cell
+        val cols = ((list.maxOf { it.x } + MARGIN_M - minX) / cell).toInt() + 1
+        val rows = ((list.maxOf { it.y } + MARGIN_M - minY) / cell).toInt() + 1
 
         val count = list.size
         val bx = DoubleArray(count) { list[it].x }
@@ -200,22 +200,36 @@ class SignalMap {
         val peak = logLikelihood[top]
         val p = DoubleArray(logLikelihood.size) { exp(logLikelihood[it] - peak) }
         val total = p.sum()
-        val ex = minX + (top % cols) * cell
-        val ey = minY + (top / cols) * cell
+        val topX = minX + (top % cols) * cell
+        val topY = minY + (top / cols) * cell
         for (i in p.indices) p[i] /= total
-        val byDistance = p.indices.sortedBy { hypot(minX + (it % cols) * cell - ex, minY + (it / cols) * cell - ey) }
+        val byDistance = p.indices.sortedBy { hypot(minX + (it % cols) * cell - topX, minY + (it / cols) * cell - topY) }
         var mass = 0.0
         var spread = 0.0
         for (i in byDistance) {
             mass += p[i]
             if (mass >= SPREAD_MASS) {
-                spread = hypot(minX + (i % cols) * cell - ex, minY + (i / cols) * cell - ey)
+                spread = hypot(minX + (i % cols) * cell - topX, minY + (i / cols) * cell - topY)
                 break
             }
         }
+        // Real fading is rougher than the model: never surer than this.
+        spread = max(spread, MIN_SPREAD_M)
+        // The middle of the likely area round the best cell, steadier than the cell itself.
+        var sx = 0.0
+        var sy = 0.0
+        var sp = 0.0
+        for (i in byDistance) {
+            val x = minX + (i % cols) * cell
+            val y = minY + (i / cols) * cell
+            if (hypot(x - topX, y - topY) > spread) break
+            sx += p[i] * x
+            sy += p[i] * y
+            sp += p[i]
+        }
         return Estimate(
-            x = ex,
-            y = ey,
+            x = sx / sp,
+            y = sy / sp,
             spreadM = spread,
             originX = minX,
             originY = minY,
@@ -227,6 +241,33 @@ class SignalMap {
             bodyDb = bestB[top],
             readings = readings,
         )
+    }
+
+    /**
+     * The spot to show, from one estimate to the next: eased towards each new
+     * one, so it doesn't hop about as readings come in, but moved at once when
+     * the map changes its mind (the other side of a straight walk, another room).
+     */
+    class Steady {
+        private var x = Double.NaN
+        private var y = Double.NaN
+
+        fun update(e: Estimate): Pair<Double, Double> {
+            val jump = hypot(e.x - x, e.y - y)
+            if (x.isNaN() || (jump > JUMP_M && jump > 2 * e.spreadM)) {
+                x = e.x
+                y = e.y
+            } else {
+                x += (e.x - x) * EASE
+                y += (e.y - y) * EASE
+            }
+            return x to y
+        }
+
+        fun reset() {
+            x = Double.NaN
+            y = Double.NaN
+        }
     }
 
     companion object {
@@ -259,6 +300,10 @@ class SignalMap {
         private const val NEAR_PATH_M = 2.0
         private const val FAR_SCALE_M = 3.0
         private const val SPREAD_MASS = 2.0 / 3
+        private const val MIN_SPREAD_M = 1.0
+        /** Of the way to each new estimate the shown spot moves, once a second. */
+        private const val EASE = 0.3
+        private const val JUMP_M = 3.0
         private const val MIN_CELL_M = 0.25
         private const val MAX_CELLS = 80
         const val MIN_READINGS = 20
