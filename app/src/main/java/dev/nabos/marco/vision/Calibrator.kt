@@ -351,8 +351,17 @@ class Calibrator(private val context: Context) {
 
     /** Measures one lens's frame; board points, or -1. Skips frames whose exposure is unknown. */
     private fun measure(lens: Int, frame: LumaFrame): Int {
-        // Without its exposure and rolling shutter, a frame's moment is unknown.
-        val info = frameInfo[lens].remove(frame.timestampNs) ?: return -1
+        // Without its exposure and rolling shutter, a frame's moment is unknown. With two lenses
+        // both lenses' frames carry the logical capture's timestamp (the main lens's on a Pixel 7a),
+        // while each lens's result carries its own sensor's, up to ~0.6 ms apart: take the nearest.
+        val infos = frameInfo[lens]
+        val nearest = infos.keys.minByOrNull { abs(it - frame.timestampNs) }
+        if (nearest == null || abs(nearest - frame.timestampNs) > MAX_INFO_GAP_NS) {
+            if (measured % 30 == 0) Log.d(TAG, "lens $lens: no capture info within ${MAX_INFO_GAP_NS / 1_000_000} ms (nearest ${nearest?.let { (it - frame.timestampNs) / 1_000_000.0 }} ms)")
+            return -1
+        }
+        val info = infos.remove(nearest)!!
+        if (measured % 30 == 0 && nearest != frame.timestampNs) Log.d(TAG, "lens $lens: capture info ${(nearest - frame.timestampNs) / 1_000_000.0} ms from the frame")
         val points = Vernier.measure(
             handles[lens], frame.luma, frame.width, frame.height, frame.width,
             frame.timestampNs, info.exposureNs ?: 0, info.rollingShutterSkewNs ?: 0,
@@ -508,6 +517,7 @@ class Calibrator(private val context: Context) {
         /** The least [finish] can calibrate from (vision's MIN_VIEWS). */
         const val MIN_VIEWS = 6
         private const val KEEP_EVERY_NS = 500_000_000L
+        private const val MAX_INFO_GAP_NS = 15_000_000L
         private const val PREVIEW_STEP = 4
         private const val GYRO_BATCH = 100
 
