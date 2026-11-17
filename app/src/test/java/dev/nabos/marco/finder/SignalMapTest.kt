@@ -4,6 +4,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import kotlin.math.abs
 import kotlin.math.hypot
 import kotlin.math.log10
 import kotlin.math.sqrt
@@ -73,9 +74,11 @@ class SignalMapTest {
     }
 
     @Test fun aStraightLineCannotTellTheSides() {
-        // Facing along the line, the body says nothing about left or right either.
+        // Facing along the line, the body says nothing about left or right either: the
+        // map picks neither side and keeps to the walked line, where the phone most
+        // likely is anyway, at the right place along it.
         val e = walk(3.0, 2.0, listOf(0.0 to 0.0, 6.0 to 0.0), seed = 1).estimate()!!
-        assertTrue("spread ${e.spreadM}", e.spreadM > 1.5)
+        assertTrue("at ${e.x}, ${e.y}", abs(e.y) < 0.5 && e.x in 1.5..4.5)
         val sure = walk(3.0, 2.0, roomWalk, seed = 1).estimate()!!
         assertTrue("spread ${sure.spreadM} vs ${e.spreadM}", sure.spreadM < e.spreadM)
     }

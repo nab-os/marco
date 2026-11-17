@@ -64,9 +64,11 @@ class SignalMap(private val tuning: Tuning = Tuning()) {
          * distance fades it in a flat, which the model reads as "further away", and
          * looser (1 and 1.5 m) it put the phone outside a 3 by 4 m flat. The spot then
          * sits at the edge of the walked area on the phone's side, and moves on as you do.
+         * Against four searches ending over the phone: 0.5 m off at the end, 1.5 m before
+         * the walk up to it (0.7 and 1.6 m at 0.5 and 0.5 m; 1.9 and 2.6 m at 2 and 3 m).
          */
-        val nearPathM: Double = 0.5,
-        val farScaleM: Double = 0.5,
+        val nearPathM: Double = 0.3,
+        val farScaleM: Double = 0.3,
     ) {
         /** The level prior as a weight in readings: (σ / sd)². */
         val aPriorWeight: Double get() = (SIGMA_DB / aPriorSdDb) * (SIGMA_DB / aPriorSdDb)
