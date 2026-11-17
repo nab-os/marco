@@ -13,8 +13,11 @@ object Vernier {
     /** The coded checkerboard as 8-bit sRGB grey pixels, row-major; null on bad sizes. */
     @JvmStatic external fun renderBoard(width: Int, height: Int, squarePx: Double): ByteArray?
 
-    /** [srgb]: frames are sRGB-encoded, as phone cameras' YUV luma is. */
-    @JvmStatic external fun newSession(srgb: Boolean): Long
+    /**
+     * [srgb]: frames are sRGB-encoded, as phone cameras' YUV luma is. Frames are averaged over
+     * [bin]×[bin] blocks before measuring, and calibrations and poses are in those binned pixels.
+     */
+    @JvmStatic external fun newSession(srgb: Boolean, bin: Int): Long
 
     @JvmStatic external fun freeSession(handle: Long)
 

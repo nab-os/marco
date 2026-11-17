@@ -72,6 +72,8 @@ fn srgb_encode(light: f32) -> f32 {
 pub struct Session {
     target: Target,
     response: Response,
+    /// Frames are averaged over `bin × bin` blocks before measuring.
+    bin: usize,
     /// Last view whose code was read, to start the next frame's search from.
     previous: Option<View>,
     /// Last view good enough to keep, until the next frame.
@@ -88,10 +90,15 @@ pub struct Session {
 
 impl Session {
     /// `response` is the transfer curve the camera encoded its frames with.
-    pub fn new(response: Response) -> Self {
+    /// Frames are averaged over `bin × bin` pixel blocks before measuring:
+    /// measuring costs about 3 s for a 1280×960 frame on a phone, a quarter of
+    /// that binned by 2, and averaging also tames a monitor's subpixel moiré.
+    /// Views, calibrations and poses are then all in binned pixels.
+    pub fn new(response: Response, bin: usize) -> Self {
         Self {
             target: target(),
             response,
+            bin: bin.max(1),
             previous: None,
             candidate: None,
             views: Vec::new(),
@@ -119,11 +126,22 @@ impl Session {
         if width == 0 || height == 0 || stride < width || luma.len() < stride * (height - 1) + width {
             return None;
         }
-        let mut frame = Vec::with_capacity(width * height);
-        for row in luma.chunks(stride).take(height) {
-            frame.extend(row[..width].iter().map(|&value| value as f32 / 255.0));
+        let bin = self.bin;
+        let (width, height) = (width / bin, height / bin);
+        if width == 0 || height == 0 {
+            return None;
         }
-        self.response.linearize(&mut frame);
+        // Averaged in light, not in encoded values.
+        let light: Vec<f32> = (0..=255u8).map(|value| self.response.light(value as f32 / 255.0)).collect();
+        let weight = 1.0 / (bin * bin) as f32;
+        let mut frame = vec![0f32; width * height];
+        for y in 0..height * bin {
+            let row = &luma[y * stride..y * stride + width * bin];
+            let out = &mut frame[(y / bin) * width..(y / bin + 1) * width];
+            for (x, &value) in row.iter().enumerate() {
+                out[x / bin] += light[value as usize] * weight;
+            }
+        }
         let measured = match &self.previous {
             Some(previous) => measure_view_after(&frame, width, height, &self.target, previous),
             None => measure_view(&frame, width, height, &self.target),
@@ -216,8 +234,9 @@ impl Session {
         exposure_ns: i64,
         rolling_shutter_skew_ns: i64,
     ) -> Option<usize> {
-        let camera = self.camera.clone().filter(|camera| camera.width == width && camera.height == height)?;
-        let view = self.read(luma, width, height, stride)?;
+        let (width, height) = (width / self.bin, height / self.bin);
+        let camera = self.camera.as_ref().and_then(|camera| scaled_to(camera, width, height))?;
+        let view = self.read(luma, width * self.bin, height * self.bin, stride)?;
         if view.points.len() < MIN_POINTS {
             return None;
         }
@@ -252,6 +271,29 @@ impl Session {
     pub fn align(&self) -> Result<CameraImu, ImuError> {
         imu::align(&self.orientations, &self.gyro)
     }
+}
+
+/// `camera` for images a whole number of times smaller than it was calibrated
+/// at, as a calibration made at full resolution seen through binning. Pixel
+/// centres map as `x / f = (X + 0.5) / f - 0.5`; distortion works on
+/// normalised coordinates and doesn't change.
+pub fn scaled_to(camera: &Camera, width: usize, height: usize) -> Option<Camera> {
+    if camera.width == width && camera.height == height {
+        return Some(camera.clone());
+    }
+    if width == 0 || camera.width % width != 0 || camera.height != height * (camera.width / width) {
+        return None;
+    }
+    let factor = (camera.width / width) as f64;
+    Some(Camera {
+        width,
+        height,
+        fx: camera.fx / factor,
+        fy: camera.fy / factor,
+        cx: (camera.cx + 0.5) / factor - 0.5,
+        cy: (camera.cy + 0.5) / factor - 0.5,
+        ..camera.clone()
+    })
 }
 
 /// A pose fitted worse than this, pixels, is a misread rather than a measurement.
@@ -368,9 +410,10 @@ pub extern "system" fn Java_dev_nabos_marco_vision_Vernier_newSession(
     _env: JNIEnv,
     _class: JClass,
     srgb: jboolean,
+    bin: jint,
 ) -> jlong {
     let response = if srgb != 0 { Response::Srgb } else { Response::Linear };
-    Box::into_raw(Box::new(Session::new(response))) as jlong
+    Box::into_raw(Box::new(Session::new(response, bin.max(1) as usize))) as jlong
 }
 
 #[unsafe(no_mangle)]
@@ -568,7 +611,7 @@ mod tests {
         let (width, height) = (480, 360);
         let pixels = render_board(width, height, 12.0);
         assert_eq!(pixels.len(), width * height);
-        let mut session = Session::new(Response::Srgb);
+        let mut session = Session::new(Response::Srgb, 1);
         let points = session.measure(&pixels, width, height, width).expect("code read");
         assert!(points >= MIN_POINTS, "{points} points");
         assert!(session.keep());
@@ -578,7 +621,7 @@ mod tests {
     fn turns_away_the_same_view_twice() {
         let (width, height) = (480, 360);
         let pixels = render_board(width, height, 12.0);
-        let mut session = Session::new(Response::Srgb);
+        let mut session = Session::new(Response::Srgb, 1);
         session.measure(&pixels, width, height, width);
         assert!(session.keep());
         session.measure(&pixels, width, height, width);
@@ -588,7 +631,7 @@ mod tests {
 
     #[test]
     fn rejects_short_buffers() {
-        let mut session = Session::new(Response::Linear);
+        let mut session = Session::new(Response::Linear, 1);
         assert_eq!(session.measure(&[0; 10], 480, 360, 480), None);
         assert!(!session.keep());
     }
@@ -618,7 +661,7 @@ mod tests {
             ([0.05, 0.4, 0.6], [-15.0, 2.0, 28.0]),
             ([-0.4, -0.05, -0.7], [3.0, 10.0, 30.0]),
         ];
-        let mut session = Session::new(Response::Linear);
+        let mut session = Session::new(Response::Linear, 1);
         for (rotation, translation) in poses {
             let pose = RigidPose::from_vectors(Vector3::from(rotation), Vector3::from(translation));
             let luma: Vec<u8> = scene.render(&pose).iter().map(|v| (v * 255.0).round() as u8).collect();
@@ -662,7 +705,7 @@ mod tests {
             wobble.push(last * UnitQuaternion::from_scaled_axis(rate((step as f64 + 0.5) * dt) * dt));
         }
 
-        let mut session = Session::new(Response::Linear);
+        let mut session = Session::new(Response::Linear, 1);
         session.set_camera(camera.clone());
         let mut t = 0.3;
         while t < seconds - 0.3 {
@@ -689,5 +732,55 @@ mod tests {
         assert!(error < 0.3, "rotation off by {error}°");
         assert!((found.time_offset_ms - 8.0).abs() < 2.0, "offset {} ms", found.time_offset_ms);
         assert!((found.off_axis_deg - 2.0).abs() < 0.3, "off axis {}°", found.off_axis_deg);
+    }
+
+    /// Where a frame's time goes with a monitor-sized board filling much of a
+    /// 1280×960 ultrawide frame. `cargo test --release timing -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn timing_on_a_monitor_board() {
+        let (width, height) = (1280, 960);
+        let camera = Camera::ideal(Model::Pinhole, width, height, 498.0, 498.0, 642.0, 477.0);
+        let board = target();
+        let scene = Scene { camera: &camera, target: &board, half_size: [40.0, 22.5], background: 0.05, supersample: 1 };
+        let pose = RigidPose::from_vectors(Vector3::new(0.2, -0.15, 0.1), Vector3::new(0.0, 0.0, 53.0));
+        let luma: Vec<u8> = scene.render(&pose).iter().map(|v| (v * 255.0).round() as u8).collect();
+        let mut session = Session::new(Response::Linear, 1);
+        let mut binned = Session::new(Response::Linear, 2);
+        for round in 0..3 {
+            let started = std::time::Instant::now();
+            let view = binned.read(&luma, width, height, width).expect("reads binned");
+            eprintln!("round {round} binned: {} points, measure {:?}", view.points.len(), started.elapsed());
+            let started = std::time::Instant::now();
+            let view = session.read(&luma, width, height, width).expect("reads");
+            let measured = started.elapsed();
+            let started = std::time::Instant::now();
+            let fit = solve_pnp(&camera, &view).expect("pose");
+            let solved = started.elapsed();
+            eprintln!("round {round}: {} points, measure {measured:?}, pnp {solved:?} (rms {:.3})", view.points.len(), fit.rms);
+        }
+    }
+
+    /// A calibration made at full resolution keeps working through binning.
+    #[test]
+    fn tracks_binned_frames_with_a_full_size_calibration() {
+        let (width, height) = (1280, 960);
+        let mut camera = Camera::ideal(Model::Pinhole, width, height, 996.0, 997.0, 641.0, 478.0);
+        camera.distortion = vec![0.02, -0.02, 0.0, 0.0, 0.004];
+        let half = scaled_to(&camera, 640, 480).expect("scales");
+        assert_eq!((half.fx, half.cx), (498.0, 320.25));
+        assert!(scaled_to(&camera, 600, 480).is_none());
+
+        let board = target();
+        let scene = Scene { camera: &camera, target: &board, half_size: [40.0, 22.5], background: 0.05, supersample: 1 };
+        let rotation = Vector3::new(0.2, -0.15, 0.1);
+        let pose = RigidPose::from_vectors(rotation, Vector3::new(0.0, 0.0, 70.0));
+        let luma: Vec<u8> = scene.render(&pose).iter().map(|v| (v * 255.0).round() as u8).collect();
+        let mut session = Session::new(Response::Linear, 2);
+        session.set_camera(camera);
+        assert!(session.track(&luma, width, height, width, 0, 0, 0).is_some(), "binned frame gives a pose");
+        let measured = session.orientations[0].camera_to_board.inverse();
+        let error = (measured.inverse() * pose.rotation).angle().to_degrees();
+        assert!(error < 0.1, "pose off by {error}°");
     }
 }

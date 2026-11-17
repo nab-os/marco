@@ -48,18 +48,25 @@ pub struct CameraImu {
     pub axis_coverage: f64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ImuError {
-    TooFewPairs(usize),
+    TooFewPairs {
+        pairs: usize,
+        poses: usize,
+        /// Median time between consecutive poses, seconds.
+        median_gap_s: f64,
+    },
     NoGyro,
 }
 
 impl std::fmt::Display for ImuError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::TooFewPairs(count) => write!(
+            Self::TooFewPairs { pairs, poses, median_gap_s } => write!(
                 f,
-                "{count} usable frame pairs; turn the phone more while keeping the board in view"
+                "{pairs} usable frame pairs from {poses} poses {median_gap_s:.1} s apart (pairs need \
+                 {PAIR_MIN_S}–{PAIR_MAX_S} s and {PAIR_MIN_DEG}° of turn); turn the phone more while \
+                 keeping the board in view"
             ),
             Self::NoGyro => write!(f, "no gyroscope readings over the frames"),
         }
@@ -70,7 +77,10 @@ impl std::error::Error for ImuError {}
 
 /// Pairs closer than this in time say little; further, the gyro has drifted.
 const PAIR_MIN_S: f64 = 0.1;
-const PAIR_MAX_S: f64 = 1.5;
+/// Generous: measuring a frame can take a second or more on a phone, and the
+/// bias is estimated, so the gyro's drift over a few seconds stays well below
+/// what the poses resolve.
+const PAIR_MAX_S: f64 = 6.0;
 /// Pairs that barely turned only add noise to the axis.
 const PAIR_MIN_DEG: f64 = 3.0;
 const MIN_PAIRS: usize = 15;
@@ -85,7 +95,13 @@ pub fn align(orientations: &[CameraOrientation], gyro: &[GyroSample]) -> Result<
     frames.sort_by_key(|frame| frame.t_ns);
     let pairs = pairs(&frames);
     if pairs.len() < MIN_PAIRS {
-        return Err(ImuError::TooFewPairs(pairs.len()));
+        let mut gaps: Vec<f64> = frames.windows(2).map(|w| (w[1].t_ns - w[0].t_ns) as f64 * 1e-9).collect();
+        gaps.sort_by(f64::total_cmp);
+        return Err(ImuError::TooFewPairs {
+            pairs: pairs.len(),
+            poses: frames.len(),
+            median_gap_s: gaps.get(gaps.len() / 2).copied().unwrap_or(0.0),
+        });
     }
 
     let mut bias = Vector3::zeros();
@@ -405,6 +421,6 @@ mod tests {
             GyroSample { t_ns: 0, rate: Vector3::zeros() },
             GyroSample { t_ns: 1_000_000_000, rate: Vector3::zeros() },
         ];
-        assert_eq!(align(&still, &gyro).unwrap_err(), ImuError::TooFewPairs(0));
+        assert_eq!(align(&still, &gyro).unwrap_err(), ImuError::TooFewPairs { pairs: 0, poses: 2, median_gap_s: 0.5 });
     }
 }

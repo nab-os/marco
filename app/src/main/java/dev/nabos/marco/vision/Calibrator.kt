@@ -118,8 +118,11 @@ class Calibrator(private val context: Context) {
     private val _state = MutableStateFlow(CalibrationState())
     val state: StateFlow<CalibrationState> = _state.asStateFlow()
 
+    /** The size frames are measured at, after binning; calibrations are for this size. */
+    private val measuredSize: Size get() = size!!.let { Size(it.width / BIN, it.height / BIN) }
+
     private val calibrationName: String
-        get() = size!!.let { "camera-${rig.label.replace('/', '-')}-${it.width}x${it.height}.json" }
+        get() = measuredSize.let { "camera-${rig.label.replace('/', '-')}-${it.width}x${it.height}.json" }
     private val savedFile: File get() = File(context.filesDir, "vision").resolve(calibrationName)
 
     fun start() {
@@ -132,10 +135,11 @@ class Calibrator(private val context: Context) {
         // Before the worker starts: it may report the saved calibration right away.
         _state.value = CalibrationState(
             running = true,
-            cameraLabel = "camera ${rig.label} · ${s.width}×${s.height}" + (fov?.let { " · %.0f° wide".format(it) } ?: ""),
+            cameraLabel = "camera ${rig.label} · ${s.width}×${s.height} → ${s.width / BIN}×${s.height / BIN}" +
+                (fov?.let { " · %.0f° wide".format(it) } ?: ""),
         )
         worker.execute {
-            handle = Vernier.newSession(true)
+            handle = Vernier.newSession(true, BIN)
             lastKeepNs = 0
             // A calibration from an earlier session: the alignment can start straight away.
             if (saved != null && Vernier.setCamera(handle, saved.getJSONObject("camera").toString())) {
@@ -285,8 +289,10 @@ class Calibrator(private val context: Context) {
     }
 
     private fun saveCalibration(json: JSONObject): CalibrationResult {
-        val factory = rig.factoryIntrinsics(size!!)
+        val factory = rig.factoryIntrinsics(measuredSize)
         json.put("device", "${Build.MANUFACTURER} ${Build.MODEL}")
+            .put("capture", "${size!!.width}x${size!!.height}")
+            .put("binning", BIN)
             .put("camera_id", rig.cameraId)
             .put("physical_camera_id", rig.physicalId)
             .put("board", JSONObject().put("code_size", 5).put("packing", "two-bits").put("unit", "square"))
@@ -342,7 +348,7 @@ class Calibrator(private val context: Context) {
             rms = json.getDouble("rms"),
             rmsByModel = byModel?.keys()?.asSequence()?.associateWith { byModel.getDouble(it) } ?: emptyMap(),
             views = json.getInt("views"),
-            factory = rig.factoryIntrinsics(size!!),
+            factory = rig.factoryIntrinsics(measuredSize),
             saved = saved,
             savedTo = file,
         )
@@ -364,6 +370,8 @@ class Calibrator(private val context: Context) {
     companion object {
         private const val TAG = "Marco.Calibrate"
         const val CAPTURE_WIDTH = 1280
+        /** Measuring a full 1280×960 frame takes about a second on a phone; binned by 2, a third of that. */
+        private const val BIN = 2
         const val MAX_VIEWS = 40
         const val MIN_VIEWS = 10
         /** Poses before the alignment is worth trying; more is better. */
