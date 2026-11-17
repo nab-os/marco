@@ -29,9 +29,6 @@ data class MapState(
     /** Where you are now and which way you face. */
     val here: TrackPoint? = null,
     val estimate: SignalMap.Estimate? = null,
-    /** Where to show the other phone: the estimate, steadied ([SignalMap.Steady]). */
-    val spotX: Double = 0.0,
-    val spotY: Double = 0.0,
     /** Readings placed on the map so far. */
     val readings: Int = 0,
 )
@@ -47,7 +44,6 @@ data class MapState(
 class SignalMapSession(private val context: Context, private val scope: CoroutineScope, private val engine: FinderEngine) {
 
     private val map = SignalMap()
-    private val steady = SignalMap.Steady()
     private var tracking: Tracking? = null
     private val jobs = mutableListOf<Job>()
     /** Readings waiting for the tracking to reach their time (poses come a fraction of a second late). */
@@ -64,7 +60,6 @@ class SignalMapSession(private val context: Context, private val scope: Coroutin
     fun start() {
         stop()
         map.clear()
-        steady.reset()
         pending.clear()
         path = emptyList()
         val t = Tracking(context.applicationContext).also { tracking = it }
@@ -83,8 +78,7 @@ class SignalMapSession(private val context: Context, private val scope: Coroutin
             while (isActive) {
                 delay(ESTIMATE_EVERY_MS)
                 val estimate = withContext(Dispatchers.Default) { map.estimate() } ?: continue
-                val (x, y) = steady.update(estimate)
-                _state.update { it.copy(estimate = estimate, spotX = x, spotY = y) }
+                _state.update { it.copy(estimate = estimate) }
             }
         }
     }

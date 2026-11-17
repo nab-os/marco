@@ -25,7 +25,8 @@ import kotlin.math.roundToInt
 /**
  * The signal map seen from above, turned so the way you face is up, centred
  * on you: where the other phone likely is (warmer = likelier), your path, and
- * the most likely spot ringed by how sure the map is. Rings every metre. You
+ * the most likely spot ringed by how sure the map is, once it is sure enough to
+ * point (before that, only the heat). Rings every metre. You
  * are the arrow, in [youColor]: the signal's hot/cold colour.
  */
 @Composable
@@ -36,7 +37,7 @@ fun SignalMapView(m: MapState, youColor: Color, modifier: Modifier) {
     Canvas(modifier) {
         val here = m.here ?: return@Canvas
         val e = m.estimate
-        val reach = e?.let { hypot(m.spotX - here.x, m.spotY - here.y) + it.spreadM } ?: 0.0
+        val reach = e?.let { hypot(it.x - here.x, it.y - here.y) + it.spreadM } ?: 0.0
         val radiusM = (reach * 1.15).coerceIn(MIN_RADIUS_M, MAX_RADIUS_M).toFloat()
         val scalePx = size.minDimension / 2 / radiusM
         // The world drawn in metres around you, y flipped (screen y points down) and
@@ -61,8 +62,9 @@ fun SignalMapView(m: MapState, youColor: Color, modifier: Modifier) {
                             }
                             drawPath(line, trail, style = Stroke(3.dp.toPx() / scalePx))
                         }
-                        e?.let {
-                            val spot = local(m.spotX, m.spotY)
+                        // The spot only once the map is sure enough to point: before, its peak wanders over the blob.
+                        e?.takeIf { it.spreadM <= UNSURE_M }?.let {
+                            val spot = local(it.x, it.y)
                             drawCircle(HOT, it.spreadM.toFloat(), spot, style = Stroke(2.dp.toPx() / scalePx))
                             drawCircle(HOT, 6.dp.toPx() / scalePx, spot)
                         }
@@ -101,8 +103,8 @@ fun mapHeadline(m: MapState): String {
     val here = m.here ?: return "Starting the cameras…"
     val e = m.estimate ?: return "Walk around"
     if (e.spreadM > UNSURE_M) return "Keep walking"
-    val dx = m.spotX - here.x
-    val dy = m.spotY - here.y
+    val dx = e.x - here.x
+    val dy = e.y - here.y
     val distance = hypot(dx, dy)
     if (distance < max(1.0, e.spreadM)) return "Right around here"
     return "≈ ${distance.roundToInt()} m ${direction(here.headingX.toDouble(), here.headingY.toDouble(), dx, dy)}"
