@@ -65,6 +65,9 @@ class CameraRig(context: Context) {
     /** Of the lens actually streamed. */
     val characteristics: CameraCharacteristics? = choice?.characteristics
 
+    /** Clockwise turn that shows the sensor's frames upright on a portrait screen (90 on most phones). */
+    val sensorOrientation: Int = characteristics?.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
+
     /** `0`, or `0/2` for lens 2 of logical camera 0. */
     val label: String get() = listOfNotNull(cameraId, physicalId).joinToString("/")
 

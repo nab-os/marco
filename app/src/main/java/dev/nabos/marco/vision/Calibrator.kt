@@ -32,7 +32,27 @@ import kotlin.math.acos
 import kotlin.math.min
 
 /** Which parts of the frame the board has visited: a grid over the frame less [inset] on each side. */
-data class Coverage(val columns: Int, val rows: Int, val inset: Float, val cells: List<Boolean>)
+data class Coverage(val columns: Int, val rows: Int, val inset: Float, val cells: List<Boolean>) {
+    /** The grid as seen after turning the frame [degrees] clockwise, like the preview. */
+    fun rotated(degrees: Int): Coverage {
+        val (w, h) = if (degrees % 180 == 0) columns to rows else rows to columns
+        return Coverage(w, h, inset, List(w * h) { i ->
+            val (x, y) = upright(i % w, i / w, columns, rows, degrees)
+            cells[y * columns + x]
+        })
+    }
+}
+
+/**
+ * The pixel of a `width × height` image that lands at ([x], [y]) once the image
+ * is turned [degrees] clockwise (0, 90, 180 or 270).
+ */
+internal fun upright(x: Int, y: Int, width: Int, height: Int, degrees: Int): Pair<Int, Int> = when ((degrees % 360 + 360) % 360) {
+    90 -> y to height - 1 - x
+    180 -> width - 1 - x to height - 1 - y
+    270 -> width - 1 - y to x
+    else -> x to y
+}
 
 data class CalibrationState(
     val running: Boolean = false,
@@ -251,7 +271,9 @@ class Calibrator(private val context: Context) {
             }
             if (++measured % 30 == 0) Log.d(TAG, "frame: ${(System.nanoTime() - started) / 1_000_000} ms")
             val s = Vernier.status(handle)
+            // Shown upright, like the preview; measuring stays on the sensor's own frame.
             val coverage = Coverage(columns = s[4], rows = s[5], inset = s[6] / 1000f, cells = s.drop(7).map { it != 0 })
+                .rotated(rig.sensorOrientation)
             val preview = preview(frame)
             _state.update {
                 it.copy(
@@ -330,15 +352,18 @@ class Calibrator(private val context: Context) {
 
     private fun fail(message: String) = _state.update { it.copy(error = message) }
 
-    /** A quarter-size grey preview of what the camera sees. */
+    /** A quarter-size grey preview of what the camera sees, turned upright for a portrait screen. */
     private fun preview(frame: LumaFrame): ImageBitmap {
         val w = frame.width / PREVIEW_STEP
         val h = frame.height / PREVIEW_STEP
-        val pixels = IntArray(w * h) { i ->
-            val g = frame.luma[(i / w) * PREVIEW_STEP * frame.width + (i % w) * PREVIEW_STEP].toInt() and 0xFF
+        val degrees = rig.sensorOrientation
+        val (outW, outH) = if (degrees % 180 == 0) w to h else h to w
+        val pixels = IntArray(outW * outH) { i ->
+            val (x, y) = upright(i % outW, i / outW, w, h, degrees)
+            val g = frame.luma[y * PREVIEW_STEP * frame.width + x * PREVIEW_STEP].toInt() and 0xFF
             (0xFF shl 24) or (g shl 16) or (g shl 8) or g
         }
-        return Bitmap.createBitmap(pixels, w, h, Bitmap.Config.ARGB_8888).asImageBitmap()
+        return Bitmap.createBitmap(pixels, outW, outH, Bitmap.Config.ARGB_8888).asImageBitmap()
     }
 
     companion object {
