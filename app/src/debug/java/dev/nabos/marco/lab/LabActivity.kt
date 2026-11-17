@@ -156,8 +156,9 @@ private fun CalibrateMode() {
         s.alignment?.let { a ->
             Text(
                 buildString {
-                    appendLine("Gyroscope alignment, ${a.pairs} frame pairs")
-                    appendLine("time offset   %+.1f ms (gyro later)".format(a.timeOffsetMs))
+                    appendLine("Gyroscope alignment, ${a.pairs} of ${a.pairsFound} pairs from ${a.poses} poses")
+                    appendLine("time offset   %+.1f ± %.1f ms (gyro later)".format(a.timeOffsetMs, a.timeOffsetSdMs))
+                    appendLine("rotation      ± %.2f°".format(a.rotationSdDeg))
                     appendLine("off square    %.2f°".format(a.offAxisDeg))
                     appendLine("vs factory    ${a.vsFactoryDeg?.let { "%.2f°".format(it) } ?: "-"}")
                     appendLine("residual      %.3f°".format(a.rmsDeg))

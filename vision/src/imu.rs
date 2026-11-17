@@ -41,7 +41,15 @@ pub struct CameraImu {
     pub off_axis_deg: f64,
     /// Over the pairs used, degrees.
     pub rms_deg: f64,
+    /// Pairs used, out of `pairs_found` that turned enough within the time window.
     pub pairs: usize,
+    pub pairs_found: usize,
+    /// Poses the pairs were made from.
+    pub poses: usize,
+    /// Spread of the time offset over resamplings of the pairs (bootstrap), ms.
+    pub time_offset_sd_ms: f64,
+    /// RMS angle between the rotation and its resampled estimates, degrees.
+    pub rotation_sd_deg: f64,
     /// How evenly the motion turned about each camera axis, 0..1: the
     /// smallest over the largest spread. Small means one axis was barely
     /// turned about, and the rotation about it is poorly known.
@@ -118,6 +126,8 @@ pub fn align(orientations: &[CameraOrientation], gyro: &[GyroSample]) -> Result<
     let (rotation, cost) = fit(&pairs, &integrated, offset_s).ok_or(ImuError::NoGyro)?;
     let used = pairs.iter().filter(|pair| integrated.covers(pair, offset_s)).count();
 
+    let (time_offset_sd_ms, rotation_sd_deg) = bootstrap(&pairs, &integrated, offset_s, &rotation);
+
     let quaternion = UnitQuaternion::from_rotation_matrix(&rotation);
     let q = quaternion.as_ref();
     Ok(CameraImu {
@@ -127,11 +137,45 @@ pub fn align(orientations: &[CameraOrientation], gyro: &[GyroSample]) -> Result<
         off_axis_deg: off_axis(&rotation).to_degrees(),
         rms_deg: (cost / used.max(1) as f64).sqrt().to_degrees(),
         pairs: used,
+        pairs_found: pairs.len(),
+        poses: frames.len(),
+        time_offset_sd_ms,
+        rotation_sd_deg,
         axis_coverage: axis_coverage(&pairs),
     })
 }
 
+/// How much the offset and rotation move when the pairs are resampled with
+/// replacement: an uncertainty from the run itself, without repeating it.
+fn bootstrap(pairs: &[Pair], integrated: &Integrated, offset_s: f64, rotation: &Rotation3<f64>) -> (f64, f64) {
+    const ROUNDS: usize = 40;
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = move |bound: usize| {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((seed >> 33) as usize) % bound
+    };
+    let (mut offsets, mut angles) = (Vec::new(), Vec::new());
+    for _ in 0..ROUNDS {
+        let sample: Vec<Pair> = (0..pairs.len()).map(|_| pairs[next(pairs.len())].clone()).collect();
+        let offset = golden(offset_s - 0.01, offset_s + 0.01, |offset| {
+            fit(&sample, integrated, offset).map_or(f64::INFINITY, |(_, cost)| cost)
+        });
+        if let Some((resampled, _)) = fit(&sample, integrated, offset) {
+            offsets.push(offset);
+            angles.push((rotation.inverse() * resampled).angle());
+        }
+    }
+    if offsets.len() < 2 {
+        return (f64::NAN, f64::NAN);
+    }
+    let mean = offsets.iter().sum::<f64>() / offsets.len() as f64;
+    let offset_sd = (offsets.iter().map(|o| (o - mean).powi(2)).sum::<f64>() / (offsets.len() - 1) as f64).sqrt();
+    let rotation_sd = (angles.iter().map(|a| a * a).sum::<f64>() / angles.len() as f64).sqrt();
+    (offset_sd * 1000.0, rotation_sd.to_degrees())
+}
+
 /// Two measured frames and how the camera turned between them.
+#[derive(Clone)]
 struct Pair {
     t0_s: f64,
     t1_s: f64,
@@ -409,6 +453,10 @@ mod tests {
         let bias_error = (Vector3::from(found.gyro_bias) - truth.bias).norm();
         assert!(bias_error < 5e-4, "bias off by {bias_error} rad/s");
         assert!(found.axis_coverage > 0.3, "coverage {}", found.axis_coverage);
+        // The truth should sit within a few bootstrap spreads.
+        assert!(found.time_offset_sd_ms > 0.0 && found.time_offset_sd_ms < 2.0, "offset sd {}", found.time_offset_sd_ms);
+        assert!((found.time_offset_ms - 12.0).abs() < 4.0 * found.time_offset_sd_ms + 0.2);
+        assert!(found.rotation_sd_deg > 0.0 && found.rotation_sd_deg < 0.2, "rotation sd {}", found.rotation_sd_deg);
     }
 
     #[test]

@@ -82,6 +82,12 @@ data class AlignmentResult(
     val vsFactoryDeg: Double?,
     val rmsDeg: Double,
     val pairs: Int,
+    /** Pairs that turned enough within the time window; [pairs] of them had gyro readings. */
+    val pairsFound: Int,
+    val poses: Int,
+    /** Bootstrap spreads: how far a repeat run would likely land. */
+    val timeOffsetSdMs: Double,
+    val rotationSdDeg: Double,
     /** 0..1; low means one axis was barely turned about. */
     val axisCoverage: Double,
     val savedTo: File,
@@ -324,6 +330,10 @@ class Calibrator(private val context: Context) {
             vsFactoryDeg = vsFactory,
             rmsDeg = json.getDouble("rms_deg"),
             pairs = json.getInt("pairs"),
+            pairsFound = json.optInt("pairs_found"),
+            poses = json.optInt("poses"),
+            timeOffsetSdMs = json.optDouble("time_offset_sd_ms"),
+            rotationSdDeg = json.optDouble("rotation_sd_deg"),
             axisCoverage = json.getDouble("axis_coverage"),
             savedTo = write(calibration),
         )
