@@ -32,7 +32,42 @@ import kotlin.math.sqrt
  * Coordinates are metres in the tracking's world (z up, so x/y are the floor).
  * Readings may be added while an estimate is being made on another thread.
  */
-class SignalMap {
+class SignalMap(private val tuning: Tuning = Tuning()) {
+
+    /** The model's knobs, with the values the app uses; the replay test tries others. */
+    data class Tuning(
+        /** The level at 1 m, give or take: phones read about −45 dBm right next to each other. */
+        val aPriorDbm: Double = -58.0,
+        val aPriorSdDb: Double = 8.0,
+        /** Fading exponents tried, and the prior among them: indoors at 2.4 GHz about 2–3. */
+        val exponents: DoubleArray = doubleArrayOf(1.6, 1.9, 2.2, 2.5, 2.8, 3.1, 3.4),
+        val nPrior: Double = 2.4,
+        val nPriorSd: Double = 0.4,
+        /**
+         * Body losses tried, and the prior: a body takes off about 5–10 dB. Left free,
+         * the body loss fits each stretch walked in one direction its own offset, and
+         * spots far off fit about as well.
+         */
+        val bodyDb: DoubleArray = doubleArrayOf(0.0, 3.0, 6.0, 9.0, 12.0, 15.0),
+        val bodyPriorDb: Double = 7.0,
+        val bodyPriorSdDb: Double = 3.0,
+        /**
+         * The other phone is likely lower (floor, sofa, bag) than the one held in front of
+         * you, chest high. Also the closest the model gets, which sets how steeply it
+         * expects the level to rise up close: steeper than real rooms (0.8 m) put the phone
+         * too far out, away from the strongest readings, in a small flat.
+         */
+        val heightM: Double = 1.2,
+        /**
+         * Within this of your path any spot is as likely; beyond, less so over [farScaleM].
+         * Looser (2 and 3 m) let spots outside a small flat win.
+         */
+        val nearPathM: Double = 1.0,
+        val farScaleM: Double = 1.5,
+    ) {
+        /** The level prior as a weight in readings: (σ / sd)². */
+        val aPriorWeight: Double get() = (SIGMA_DB / aPriorSdDb) * (SIGMA_DB / aPriorSdDb)
+    }
 
     /** One reading where it was taken: position, the horizontal way the camera faced (unit or zero). */
     data class Reading(val x: Double, val y: Double, val headingX: Double, val headingY: Double, val rssi: Int, val fromConnection: Boolean)
@@ -158,7 +193,7 @@ class SignalMap {
                 val dx = cx - bx[i]
                 val dy = cy - by[i]
                 val flat = hypot(dx, dy)
-                val l = 10 * log10(sqrt(flat * flat + HEIGHT_M * HEIGHT_M))
+                val l = 10 * log10(sqrt(flat * flat + tuning.heightM * tuning.heightM))
                 // 0 facing the spot, 1 with your back to it; ½ when the heading is unknown or the spot is right here.
                 val facing = if (flat > 1e-6) (bhx[i] * dx + bhy[i] * dy) / flat else 0.0
                 val b = (1 - facing) / 2
@@ -176,17 +211,17 @@ class SignalMap {
             // and the squared error follows from the sums.
             // In units of 2σ², so that the priors on n and B can join it.
             var best = Double.MAX_VALUE
-            for (n in EXPONENTS) for (bodyDb in BODY_DB) {
-                val nOff = (n - N_PRIOR) / N_PRIOR_SD
-                val bOff = (bodyDb - BODY_PRIOR_DB) / BODY_PRIOR_SD_DB
+            for (n in tuning.exponents) for (bodyDb in tuning.bodyDb) {
+                val nOff = (n - tuning.nPrior) / tuning.nPriorSd
+                val bOff = (bodyDb - tuning.bodyPriorDb) / tuning.bodyPriorSdDb
                 var sse = (nOff * nOff + bOff * bOff) * SIGMA_DB * SIGMA_DB
                 for (s in 0..1) {
                     if (w[s] == 0.0) continue
                     val z1 = wr[s] + n * wl[s] + bodyDb * wb[s]
                     val z2 = wrr[s] + n * n * wll[s] + bodyDb * bodyDb * wbb[s] +
                         2 * n * wrl[s] + 2 * bodyDb * wrb[s] + 2 * n * bodyDb * wlb[s]
-                    val a = (z1 + A_PRIOR_WEIGHT * A_PRIOR_DBM) / (w[s] + A_PRIOR_WEIGHT)
-                    sse += z2 - 2 * a * z1 + a * a * w[s] + A_PRIOR_WEIGHT * (a - A_PRIOR_DBM) * (a - A_PRIOR_DBM)
+                    val a = (z1 + tuning.aPriorWeight * tuning.aPriorDbm) / (w[s] + tuning.aPriorWeight)
+                    sse += z2 - 2 * a * z1 + a * a * w[s] + tuning.aPriorWeight * (a - tuning.aPriorDbm) * (a - tuning.aPriorDbm)
                 }
                 if (sse < best) {
                     best = sse
@@ -196,7 +231,7 @@ class SignalMap {
             }
             var nearest = Double.MAX_VALUE
             for (i in 0 until count) nearest = min(nearest, hypot(cx - bx[i], cy - by[i]))
-            val beyond = max(0.0, nearest - NEAR_PATH_M) / FAR_SCALE_M
+            val beyond = max(0.0, nearest - tuning.nearPathM) / tuning.farScaleM
             logLikelihood[row * cols + col] = -best / (2 * SIGMA_DB * SIGMA_DB) - beyond * beyond / 2
         }
 
@@ -304,32 +339,8 @@ class SignalMap {
         private const val WEIGHT_CAP = 4
         /** Spread of one reading around the model, dB: multipath fading indoors. */
         private const val SIGMA_DB = 6.0
-        /** The level at 1 m, give or take 8 dB: phones read about −45 dBm right next to each other. */
-        private const val A_PRIOR_DBM = -58.0
-        /** That prior as a weight in readings: (σ / 8 dB)². */
-        private const val A_PRIOR_WEIGHT = (SIGMA_DB / 8.0) * (SIGMA_DB / 8.0)
-        private val EXPONENTS = doubleArrayOf(1.6, 1.9, 2.2, 2.5, 2.8, 3.1, 3.4)
-        private val BODY_DB = doubleArrayOf(0.0, 3.0, 6.0, 9.0, 12.0, 15.0)
-        /**
-         * Indoors at 2.4 GHz the exponent is about 2–3, and a body takes off about
-         * 5–10 dB (measured turning on the spot). Left free, the body loss fits each stretch walked
-         * in one direction its own offset, and spots far off fit about as well.
-         */
-        private const val N_PRIOR = 2.4
-        private const val N_PRIOR_SD = 0.4
-        private const val BODY_PRIOR_DB = 7.0
-        private const val BODY_PRIOR_SD_DB = 3.0
-        /**
-         * The other phone is likely lower (floor, sofa, bag) than the one held in front of
-         * you. Also the closest the model gets: right under a reading it would otherwise
-         * predict an extreme level, and spike.
-         */
-        private const val HEIGHT_M = 0.8
         /** How far past your path it may be. */
         private const val MARGIN_M = 8.0
-        /** Within this of your path any spot is as likely; beyond, less so over [FAR_SCALE_M]. */
-        private const val NEAR_PATH_M = 2.0
-        private const val FAR_SCALE_M = 3.0
         private const val SPREAD_MASS = 2.0 / 3
         private const val MIN_SPREAD_M = 1.0
         /** Of the way from the last map to the new one, per estimate (once a second). */
