@@ -19,8 +19,12 @@ import dev.nabos.marco.core.Protocol
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
@@ -48,6 +52,9 @@ data class FinderState(
     val message: String? = null,
 )
 
+/** One unfiltered RSSI reading. Advert and connection readings aren't comparable. */
+data class RssiSample(val rssi: Int, val fromConnection: Boolean)
+
 /**
  * Finder side: scans for one paired phone's rotating ID, connects over GATT to
  * poll RSSI ~4×/s, filters it, beeps faster as you get closer, and sends
@@ -61,6 +68,10 @@ class FinderEngine(private val context: Context, private val scope: CoroutineSco
     private val store = PeerStore.get(context)
     private val _state = MutableStateFlow(FinderState(sound = store.proximitySound, autoRing = store.autoRing))
     val state: StateFlow<FinderState> = _state.asStateFlow()
+
+    private val _samples = MutableSharedFlow<RssiSample>(extraBufferCapacity = 16, onBufferOverflow = BufferOverflow.DROP_OLDEST)
+    /** Raw readings as they arrive, for "point at it" sweeps. */
+    val samples: SharedFlow<RssiSample> = _samples.asSharedFlow()
 
     private enum class Source { ADVERT, CONNECTION }
 
@@ -315,6 +326,7 @@ class FinderEngine(private val context: Context, private val scope: CoroutineSco
     // --- signal processing ----------------------------------------------------------
 
     private fun feed(rssi: Int, src: Source) {
+        _samples.tryEmit(RssiSample(rssi, src == Source.CONNECTION))
         // Advert and connection RSSI can use different TX power; don't blend them.
         if (src != source) {
             filter.reset()

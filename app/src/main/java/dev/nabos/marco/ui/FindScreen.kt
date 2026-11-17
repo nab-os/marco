@@ -24,6 +24,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -48,21 +49,29 @@ import dev.nabos.marco.core.Peer
 import dev.nabos.marco.finder.FinderEngine
 import dev.nabos.marco.finder.FinderState
 import dev.nabos.marco.finder.LinkPhase
+import dev.nabos.marco.finder.PointAtIt
+import dev.nabos.marco.finder.PointPhase
 import kotlin.math.roundToInt
 
 class FinderViewModel(app: Application) : AndroidViewModel(app) {
     val engine = FinderEngine(app, viewModelScope)
-    override fun onCleared() = engine.stop()
+    val point = PointAtIt(app, viewModelScope, engine)
+    override fun onCleared() {
+        point.stop()
+        engine.stop()
+    }
 }
 
-private val COLD = Color(0xFF3D7BFF)
-private val HOT = Color(0xFFFF3B1F)
+internal val COLD = Color(0xFF3D7BFF)
+internal val HOT = Color(0xFFFF3B1F)
 
 @Composable
 fun FindScreen(modifier: Modifier, peer: Peer, onBack: () -> Unit) {
     val peerName = peer.name
     val vm: FinderViewModel = viewModel()
     val s by vm.engine.state.collectAsStateWithLifecycle()
+    val p by vm.point.state.collectAsStateWithLifecycle()
+    val pointing = p.phase != PointPhase.OFF
 
     // Scan only while this screen is visible, and keep the screen on meanwhile
     // (Android stops delivering unfiltered scan results when the screen is off).
@@ -71,6 +80,7 @@ fun FindScreen(modifier: Modifier, peer: Peer, onBack: () -> Unit) {
         view.keepScreenOn = true
         vm.engine.start(peer)
         onDispose {
+            vm.point.stop()
             vm.engine.stop()
             view.keepScreenOn = false
         }
@@ -94,15 +104,32 @@ fun FindScreen(modifier: Modifier, peer: Peer, onBack: () -> Unit) {
 
         Text(phaseLine(s), style = MaterialTheme.typography.bodyMedium, textAlign = TextAlign.Center)
 
-        HeatGauge(s, Modifier.fillMaxWidth().weight(1f))
+        if (pointing) {
+            PointDial(p, Modifier.fillMaxWidth().weight(1f))
+            Text(pointHeadline(p), fontSize = 40.sp, fontWeight = FontWeight.Bold)
+            Text(pointDetail(p), style = MaterialTheme.typography.bodyMedium, textAlign = TextAlign.Center)
+        } else {
+            HeatGauge(s, Modifier.fillMaxWidth().weight(1f))
+            Text(
+                heatLabel(s),
+                fontSize = 40.sp,
+                fontWeight = FontWeight.Bold,
+                color = if (s.stale) MaterialTheme.colorScheme.onSurfaceVariant else lerp(COLD, HOT, s.level),
+            )
+            Text(detailLine(s), style = MaterialTheme.typography.bodyMedium)
+        }
 
-        Text(
-            heatLabel(s),
-            fontSize = 40.sp,
-            fontWeight = FontWeight.Bold,
-            color = if (s.stale) MaterialTheme.colorScheme.onSurfaceVariant else lerp(COLD, HOT, s.level),
-        )
-        Text(detailLine(s), style = MaterialTheme.typography.bodyMedium)
+        if (!p.unsupported) {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                OutlinedButton(
+                    onClick = { if (pointing) vm.point.stop() else vm.point.start() },
+                    modifier = Modifier.weight(1f),
+                ) { Text(if (pointing) "Hot/cold" else "Point at it") }
+                if (p.phase == PointPhase.DONE) {
+                    OutlinedButton(onClick = vm.point::restartSweep, modifier = Modifier.weight(1f)) { Text("Sweep again") }
+                }
+            }
+        }
 
         s.message?.let {
             Text(it, color = MaterialTheme.colorScheme.error, textAlign = TextAlign.Center)
@@ -192,7 +219,7 @@ private fun heatLabel(s: FinderState): String {
 
 private fun detailLine(s: FinderState): String {
     val r = s.rssi ?: return "Walk around slowly. Hold the phone in front of you."
-    return "${r.roundToInt()} dBm (raw ${s.rawRssi}) · turn slowly: your body blocks the signal"
+    return "${r.roundToInt()} dBm (raw ${s.rawRssi}) · tap Point at it to find the direction"
 }
 
 private fun phaseLine(s: FinderState): String = when (s.phase) {
