@@ -6,12 +6,14 @@
 //! JNI entry points at the bottom are what the app calls.
 
 pub mod imu;
+pub mod tracker;
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use jni::JNIEnv;
-use jni::objects::{JByteArray, JClass, JFloatArray, JLongArray};
-use jni::sys::{jboolean, jbyteArray, jdouble, jint, jintArray, jlong, jstring};
+use jni::objects::{JByteArray, JClass, JFloatArray, JLongArray, JString};
+use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jbyteArray, jdouble, jdoubleArray, jint, jintArray, jlong, jstring};
+use std::sync::Mutex;
 use nalgebra::{Matrix3, UnitQuaternion, Vector3};
 use serde::Serialize;
 use vernier_camera::geometry::homography;
@@ -840,6 +842,116 @@ pub extern "system" fn Java_dev_nabos_marco_vision_Vernier_binLuma(
     let binned = guarded(Vec::new(), || bin_luma(&bytes, width, height, bin.max(1) as usize));
     env.byte_array_from_slice(&binned)
         .map_or(std::ptr::null_mut(), |array| array.into_raw())
+}
+
+// --- JNI: live tracking with Basalt (see tracker.rs) --------------------------------
+//
+// The tracker sits behind a mutex: IMU readings, camera frames and polling come
+// from different threads.
+
+unsafe fn tracker<'a>(handle: jlong) -> &'a Mutex<tracker::Tracker> {
+    unsafe { &*(handle as *const Mutex<tracker::Tracker>) }
+}
+
+/// `{"handle": n}` or `{"error": ...}`: starts Basalt with a Marco stereo
+/// calibration, writing its files into `dir`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_nabos_marco_vision_Vernier_trackerStart(
+    mut env: JNIEnv,
+    _class: JClass,
+    calibration: JString,
+    dir: JString,
+) -> jstring {
+    let (Ok(calibration), Ok(dir)) = (env.get_string(&calibration).map(String::from), env.get_string(&dir).map(String::from)) else {
+        return std::ptr::null_mut();
+    };
+    let json = guarded(error_json("tracker crashed while starting"), || {
+        match tracker::Tracker::start(&calibration, std::path::Path::new(&dir)) {
+            Ok(t) => serde_json::json!({ "handle": Box::into_raw(Box::new(Mutex::new(t))) as i64 }).to_string(),
+            Err(e) => error_json(&e),
+        }
+    });
+    env.new_string(json).map_or(std::ptr::null_mut(), |string| string.into_raw())
+}
+
+/// `count` IMU readings: times in ns and `ax ay az wx wy wz` per reading.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_nabos_marco_vision_Vernier_trackerPushImu(
+    env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    times: JLongArray,
+    values: JFloatArray,
+    count: jint,
+) {
+    let count = count.max(0) as usize;
+    let mut t = vec![0i64; count];
+    let mut v = vec![0f32; count * 6];
+    if env.get_long_array_region(&times, 0, &mut t).is_err() || env.get_float_array_region(&values, 0, &mut v).is_err() {
+        return;
+    }
+    guarded((), || {
+        let mut tracker = unsafe { tracker(handle) }.lock().unwrap_or_else(|e| e.into_inner());
+        for (t_ns, s) in t.iter().zip(v.chunks(6)) {
+            tracker.push_imu(*t_ns, [s[0], s[1], s[2]], [s[3], s[4], s[5]]);
+        }
+    })
+}
+
+/// A stereo pair taken together, `t_ns` its moment on the camera clock.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn Java_dev_nabos_marco_vision_Vernier_trackerPushFrames(
+    env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+    t_ns: jlong,
+    luma0: JByteArray,
+    width0: jint,
+    height0: jint,
+    luma1: JByteArray,
+    width1: jint,
+    height1: jint,
+) -> jboolean {
+    let (Ok(a), Ok(b)) = (env.convert_byte_array(&luma0), env.convert_byte_array(&luma1)) else {
+        return JNI_FALSE;
+    };
+    guarded(JNI_FALSE, || {
+        let mut tracker = unsafe { tracker(handle) }.lock().unwrap_or_else(|e| e.into_inner());
+        let pushed = tracker.push_frames(t_ns, (&a, width0.max(0) as u32, height0.max(0) as u32), (&b, width1.max(0) as u32, height1.max(0) as u32));
+        if pushed { JNI_TRUE } else { JNI_FALSE }
+    })
+}
+
+/// Poses since the last poll: `t_ns, px, py, pz, qx, qy, qz, qw` each.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_nabos_marco_vision_Vernier_trackerPoll(
+    env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jdoubleArray {
+    let values: Vec<f64> = guarded(Vec::new(), || {
+        let poses = unsafe { tracker(handle) }.lock().unwrap_or_else(|e| e.into_inner()).poll();
+        poses
+            .iter()
+            .flat_map(|p| [p.timestamp as f64, p.px as f64, p.py as f64, p.pz as f64, p.ox as f64, p.oy as f64, p.oz as f64, p.ow as f64])
+            .collect()
+    });
+    let Ok(array) = env.new_double_array(values.len() as i32) else {
+        return std::ptr::null_mut();
+    };
+    if env.set_double_array_region(&array, 0, &values).is_err() {
+        return std::ptr::null_mut();
+    }
+    array.into_raw()
+}
+
+/// Stops Basalt and frees the tracker; the handle is then invalid.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_nabos_marco_vision_Vernier_trackerFree(_env: JNIEnv, _class: JClass, handle: jlong) {
+    if handle != 0 {
+        guarded((), || drop(unsafe { Box::from_raw(handle as *mut Mutex<tracker::Tracker>) }));
+    }
 }
 
 fn error_json(message: &str) -> String {

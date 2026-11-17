@@ -38,11 +38,18 @@ if (visionEnabled) {
     }
     val copyVision by tasks.registering(Copy::class) {
         from(cargoBuildVision.map { it.outputs.files })
+        // Basalt for live tracking, if vision/basalt-android/build.sh has been run (or
+        // marco.basalt.dir points at its work dir): loaded at run time, optional.
+        val basaltLib = File(localProperties.getProperty("marco.basalt.dir") ?: "${visionDir.path}/basalt-android/build", "prefix/android")
+        from(basaltLib) { include("libbasalt.so", "libtbb.so", "libc++_shared.so") }
         into(visionLib.parentFile)
     }
     tasks.matching { it.name == "preBuild" }.configureEach { dependsOn(copyVision) }
 } else {
-    // Don't ship a library left over from an earlier build with vision on.
-    val removeVision by tasks.registering(Delete::class) { delete(visionLib) }
+    // Don't ship libraries left over from an earlier build with vision on.
+    val removeVision by tasks.registering(Delete::class) {
+        delete(visionLib)
+        listOf("libbasalt.so", "libtbb.so", "libc++_shared.so").forEach { delete(File(visionLib.parentFile, it)) }
+    }
     tasks.matching { it.name == "preBuild" }.configureEach { dependsOn(removeVision) }
 }

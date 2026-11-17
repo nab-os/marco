@@ -8,3 +8,7 @@ local.properties
 .kotlin/
 vision/target/
 /app/src/main/jniLibs/arm64-v8a/libmarco_vision.so
+/app/src/main/jniLibs/arm64-v8a/libbasalt.so
+/app/src/main/jniLibs/arm64-v8a/libtbb.so
+/app/src/main/jniLibs/arm64-v8a/libc++_shared.so
+vision/basalt-android/build/

@@ -5,8 +5,8 @@
 #   vision/basalt-android/build.sh [WORK_DIR]
 #
 # WORK_DIR (default vision/basalt-android/build) gets the downloaded sources,
-# the build trees and prefix/: libbasalt.so, libtbb.so, libc++_shared.so and
-# bin/basalt_runner. Needs the Android NDK (ANDROID_NDK_HOME, or the newest
+# the build trees and prefix/: android/ holds the stripped libbasalt.so,
+# libtbb.so and libc++_shared.so the app ships, bin/ the runner for adb. Needs the Android NDK (ANDROID_NDK_HOME, or the newest
 # under ~/Android/Sdk/ndk), cmake and ninja.
 #
 # Licences: Basalt BSD-3, oneTBB Apache-2.0, OpenCV Apache-2.0, fmt MIT.
@@ -88,5 +88,10 @@ build runner "$HERE/../tools/basalt_runner" \
 
 # The C++ runtime the libraries share.
 cp "$NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" "$PREFIX/lib/"
-echo "== done: $PREFIX/lib"
-ls -la "$PREFIX"/lib/*.so* "$PREFIX/bin/basalt_runner"
+# Stripped copies to ship in the app (296 MB of debug info otherwise).
+mkdir -p "$PREFIX/android"
+for lib in libbasalt.so libtbb.so libc++_shared.so; do
+  "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" --strip-unneeded -o "$PREFIX/android/$lib" "$PREFIX/lib/$lib"
+done
+echo "== done: $PREFIX/android"
+ls -la "$PREFIX"/android/*.so "$PREFIX/bin/basalt_runner"

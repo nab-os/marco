@@ -61,4 +61,25 @@ object Vernier {
 
     /** [luma] (`width × height`, rows packed) averaged over [bin]×[bin] blocks; null on a short buffer. */
     @JvmStatic external fun binLuma(luma: ByteArray, width: Int, height: Int, bin: Int): ByteArray?
+
+    // Live tracking with Basalt, loaded at run time (libbasalt.so, from vision/basalt-android).
+
+    /** Starts Basalt with a stereo calibration, writing its files into [dir]: `{handle}` or `{error}`. */
+    @JvmStatic external fun trackerStart(calibrationJson: String, dir: String): String
+
+    /** [count] IMU readings: [times] in ns, [values] as `ax ay az wx wy wz` each (m/s², rad/s). */
+    @JvmStatic external fun trackerPushImu(handle: Long, times: LongArray, values: FloatArray, count: Int)
+
+    /** A stereo pair from one capture, [timestampNs] its mid-exposure on the camera clock; false if dropped. */
+    @JvmStatic external fun trackerPushFrames(
+        handle: Long, timestampNs: Long,
+        luma0: ByteArray, width0: Int, height0: Int,
+        luma1: ByteArray, width1: Int, height1: Int,
+    ): Boolean
+
+    /** Poses since the last poll, `t_ns px py pz qx qy qz qw` each, metres in a gravity-aligned world. */
+    @JvmStatic external fun trackerPoll(handle: Long): DoubleArray
+
+    /** Stops Basalt and frees the tracker; [handle] is then invalid. */
+    @JvmStatic external fun trackerFree(handle: Long)
 }

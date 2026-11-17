@@ -49,6 +49,8 @@ import dev.nabos.marco.vision.CalibrationBoard
 import dev.nabos.marco.vision.Coverage
 import dev.nabos.marco.vision.Calibrator
 import dev.nabos.marco.vision.Recorder
+import dev.nabos.marco.vision.TrackPoint
+import dev.nabos.marco.vision.Tracking
 import dev.nabos.marco.vision.Vernier
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlin.math.roundToInt
@@ -73,7 +75,7 @@ class LabActivity : ComponentActivity() {
     }
 }
 
-private enum class Mode { MENU, BOARD, CALIBRATE, RECORD, STEREO }
+private enum class Mode { MENU, BOARD, CALIBRATE, RECORD, STEREO, TRACK }
 
 @Composable
 private fun Lab(initial: Mode) {
@@ -90,6 +92,7 @@ private fun Lab(initial: Mode) {
         Mode.CALIBRATE -> if (cameraOk) CalibrateMode() else NeedCamera { askCamera.launch(Manifest.permission.CAMERA) }
         Mode.RECORD -> if (cameraOk) RecordMode() else NeedCamera { askCamera.launch(Manifest.permission.CAMERA) }
         Mode.STEREO -> if (cameraOk) StereoMode() else NeedCamera { askCamera.launch(Manifest.permission.CAMERA) }
+        Mode.TRACK -> if (cameraOk) TrackMode() else NeedCamera { askCamera.launch(Manifest.permission.CAMERA) }
         Mode.MENU -> Column(
             Modifier.safeDrawingPadding().padding(24.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
@@ -99,6 +102,7 @@ private fun Lab(initial: Mode) {
             Button({ mode = Mode.BOARD }, Modifier.fillMaxWidth(), enabled = Vernier.available) { Text("Show calibration board") }
             Button({ mode = Mode.CALIBRATE }, Modifier.fillMaxWidth(), enabled = Vernier.available) { Text("Calibrate this camera") }
             OutlinedButton({ mode = Mode.RECORD }, Modifier.fillMaxWidth()) { Text("Record camera + motion") }
+            Button({ mode = Mode.TRACK }, Modifier.fillMaxWidth(), enabled = Vernier.available) { Text("Track (Basalt)") }
             OutlinedButton({ mode = Mode.STEREO }, Modifier.fillMaxWidth()) { Text("Stereo test") }
             Text(
                 "Show the board on one phone and calibrate on the other. Recordings and calibrations go to " +
@@ -231,6 +235,68 @@ private fun CoverageGrid(coverage: Coverage, modifier: Modifier) {
             if (!visited) drawRect(Color.Black.copy(alpha = 0.45f), topLeft, cell)
             drawRect(line.copy(alpha = 0.6f), topLeft, cell, style = Stroke(1.dp.toPx()))
         }
+    }
+}
+
+@Composable
+private fun TrackMode() {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val tracking = remember { Tracking(context.applicationContext) }
+    DisposableEffect(tracking) {
+        tracking.start(scope)
+        onDispose { tracking.close() }
+    }
+    val s by tracking.state.collectAsStateWithLifecycle()
+    Column(Modifier.safeDrawingPadding().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        TrackMap(s.path, Modifier.fillMaxWidth().aspectRatio(1f))
+        val last = s.path.lastOrNull()
+        Text(
+            buildString {
+                appendLine(s.status)
+                appendLine("path %.2f m · %.0f poses/s · latency %.0f ms".format(s.pathLengthM, s.rate, s.latencyMs))
+                last?.let { append("at (%+.2f, %+.2f) m, height %+.2f m".format(it.x, it.y, it.z)) }
+            },
+            fontFamily = FontFamily.Monospace,
+            style = MaterialTheme.typography.bodySmall,
+        )
+        Text(
+            "Hold the phone in front of you, cameras facing the room, and walk. The map is seen from above, " +
+                "north being wherever the phone faced at the start; the arrow is where the camera looks.",
+            style = MaterialTheme.typography.bodySmall,
+        )
+        s.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+    }
+}
+
+/** The path seen from above, fitted to the box with at least 2 m across, with a 1 m grid. */
+@Composable
+private fun TrackMap(path: List<TrackPoint>, modifier: Modifier) {
+    val line = MaterialTheme.colorScheme.primary
+    val grid = MaterialTheme.colorScheme.outlineVariant
+    val here = MaterialTheme.colorScheme.tertiary
+    Canvas(modifier) {
+        if (path.isEmpty()) return@Canvas
+        val xs = path.map { it.x }
+        val ys = path.map { it.y }
+        val span = maxOf(2f, xs.max() - xs.min(), ys.max() - ys.min()) * 1.15f
+        val cx = (xs.max() + xs.min()) / 2
+        val cy = (ys.max() + ys.min()) / 2
+        val scale = minOf(size.width, size.height) / span
+        fun at(x: Float, y: Float) = Offset(size.width / 2 + (x - cx) * scale, size.height / 2 - (y - cy) * scale)
+        // 1 m grid.
+        val left = kotlin.math.floor(cx - span / 2).toInt()
+        val bottom = kotlin.math.floor(cy - span / 2).toInt()
+        for (i in 0..span.toInt() + 1) {
+            drawLine(grid, at((left + i).toFloat(), cy - span), at((left + i).toFloat(), cy + span), 1f)
+            drawLine(grid, at(cx - span, (bottom + i).toFloat()), at(cx + span, (bottom + i).toFloat()), 1f)
+        }
+        for (i in 1 until path.size) drawLine(line, at(path[i - 1].x, path[i - 1].y), at(path[i].x, path[i].y), 4f)
+        val p = path.last()
+        val tip = at(p.x + p.headingX * 0.4f, p.y + p.headingY * 0.4f)
+        drawLine(here, at(p.x, p.y), tip, 6f)
+        drawCircle(here, 10f, at(p.x, p.y))
+        drawCircle(grid, 8f, at(path.first().x, path.first().y))
     }
 }
 
