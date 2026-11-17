@@ -38,7 +38,7 @@ class SignalMap {
     data class Reading(val x: Double, val y: Double, val headingX: Double, val headingY: Double, val rssi: Int, val fromConnection: Boolean)
 
     data class Estimate(
-        /** The most likely spot: the peak of the (time-smoothed) probability. */
+        /** The most likely spot: the middle of the (time-smoothed) probability's hottest area. */
         val x: Double,
         val y: Double,
         /** The radius around that spot holding two thirds of the probability, metres: how sure it is. */
@@ -219,14 +219,19 @@ class SignalMap {
         smoothed.clear()
         for (i in p.indices) smoothed[(baseCol + i % cols) * 1_000_000L + (baseRow + i / cols)] = p[i]
 
-        val top = p.indices.maxBy { p[it] }
+        // Shown and read blurred a little: a spot right under a reading predicts an extreme
+        // level there, so single cells along the path spike; the eye reads the middle of the
+        // hot area, and of two blobs the bigger one.
+        val blurred = blur(p, cols, rows, PEAK_BLUR_M / cell)
+        normalise(blurred)
+        val top = blurred.indices.maxBy { blurred[it] }
         val topX = minX + (top % cols) * cell
         val topY = minY + (top / cols) * cell
         val byDistance = p.indices.sortedBy { hypot(minX + (it % cols) * cell - topX, minY + (it / cols) * cell - topY) }
         var mass = 0.0
         var spread = 0.0
         for (i in byDistance) {
-            mass += p[i]
+            mass += blurred[i]
             if (mass >= SPREAD_MASS) {
                 spread = hypot(minX + (i % cols) * cell - topX, minY + (i / cols) * cell - topY)
                 break
@@ -242,9 +247,9 @@ class SignalMap {
             val x = minX + (i % cols) * cell
             val y = minY + (i / cols) * cell
             if (hypot(x - topX, y - topY) > max(PEAK_AROUND_M, cell)) break
-            sx += p[i] * x
-            sy += p[i] * y
-            sp += p[i]
+            sx += blurred[i] * x
+            sy += blurred[i] * y
+            sp += blurred[i]
         }
         return Estimate(
             x = sx / sp,
@@ -255,11 +260,36 @@ class SignalMap {
             cellM = cell,
             cols = cols,
             rows = rows,
-            probability = FloatArray(p.size) { p[it].toFloat() },
+            probability = FloatArray(blurred.size) { blurred[it].toFloat() },
             exponent = bestN[top],
             bodyDb = bestB[top],
             readings = readings,
         )
+    }
+
+    /** A Gaussian blur of [sigma] cells, separable, cut at 2σ. */
+    private fun blur(p: DoubleArray, cols: Int, rows: Int, sigma: Double): DoubleArray {
+        val radius = kotlin.math.ceil(2 * sigma).toInt()
+        val kernel = DoubleArray(2 * radius + 1) { exp(-((it - radius) * (it - radius)) / (2 * sigma * sigma)) }
+        val pass = DoubleArray(p.size)
+        for (row in 0 until rows) for (col in 0 until cols) {
+            var sum = 0.0
+            for (k in -radius..radius) {
+                val c = col + k
+                if (c in 0 until cols) sum += p[row * cols + c] * kernel[k + radius]
+            }
+            pass[row * cols + col] = sum
+        }
+        val out = DoubleArray(p.size)
+        for (row in 0 until rows) for (col in 0 until cols) {
+            var sum = 0.0
+            for (k in -radius..radius) {
+                val r = row + k
+                if (r in 0 until rows) sum += pass[r * cols + col] * kernel[k + radius]
+            }
+            out[row * cols + col] = sum
+        }
+        return out
     }
 
     private fun normalise(p: DoubleArray) {
@@ -289,8 +319,12 @@ class SignalMap {
         private const val N_PRIOR_SD = 0.4
         private const val BODY_PRIOR_DB = 7.0
         private const val BODY_PRIOR_SD_DB = 3.0
-        /** The other phone is likely lower (floor, sofa, bag) than the one held in front of you. */
-        private const val HEIGHT_M = 0.6
+        /**
+         * The other phone is likely lower (floor, sofa, bag) than the one held in front of
+         * you. Also the closest the model gets: right under a reading it would otherwise
+         * predict an extreme level, and spike.
+         */
+        private const val HEIGHT_M = 0.8
         /** How far past your path it may be. */
         private const val MARGIN_M = 8.0
         /** Within this of your path any spot is as likely; beyond, less so over [FAR_SCALE_M]. */
@@ -301,6 +335,7 @@ class SignalMap {
         /** Of the way from the last map to the new one, per estimate (once a second). */
         private const val SMOOTHING = 0.5
         private const val PEAK_AROUND_M = 0.5
+        private const val PEAK_BLUR_M = 0.5
         private const val MIN_CELL_M = 0.25
         private const val MAX_CELLS = 80
         const val MIN_READINGS = 20
