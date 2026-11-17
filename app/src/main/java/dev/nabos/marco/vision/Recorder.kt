@@ -46,12 +46,14 @@ data class RecorderStats(
  * sensors and RSSI, all stamped on the elapsedRealtime clock, into
  * `Android/data/dev.nabos.marco/files/recordings/<date>/`:
  *
- * - `frames.y8`: raw 8-bit luma, frames back to back, size in `meta.json`.
+ * - `frames.y8`: raw 8-bit luma, frames back to back, size in `meta.json`: captured at
+ *   1280×960 and averaged over 2×2 blocks, the geometry [Calibrator] calibrates.
  * - `frames.csv`: `index,timestamp_ns` per frame in `frames.y8`.
  * - `capture.csv`: `timestamp_ns,exposure_ns,rolling_shutter_skew_ns,frame_duration_ns,focus_diopters`.
  * - `imu.csv`: `timestamp_ns,sensor,x,y,z` with sensor `g` (gyro, rad/s) or `a` (accelerometer, m/s²).
  * - `rssi.csv`: `timestamp_ns,rssi_dbm,connection` (1: GATT connection, 0: advert).
  * - `meta.json`: device, camera factory calibration and pose, sensors.
+ * - `calibration.json`: this camera's calibration and gyroscope alignment, if one was made.
  */
 class Recorder(private val context: Context) {
 
@@ -71,14 +73,19 @@ class Recorder(private val context: Context) {
     private val _stats = MutableStateFlow(RecorderStats())
     val stats: StateFlow<RecorderStats> = _stats.asStateFlow()
 
-    fun start(scope: CoroutineScope, samples: Flow<RssiSample>? = null, maxWidth: Int = 640) {
+    fun start(scope: CoroutineScope, samples: Flow<RssiSample>? = null, captureWidth: Int = 1280, bin: Int = 2) {
         if (_stats.value.recording) return
-        val size = rig.outputSize(maxWidth) ?: return fail("No 4:3 camera stream up to $maxWidth px wide.")
+        val capture = rig.outputSize(captureWidth) ?: return fail("No 4:3 camera stream up to $captureWidth px wide.")
+        val size = Size(capture.width / bin, capture.height / bin)
         val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
         val dir = File(context.getExternalFilesDir("recordings"), stamp).apply { mkdirs() }
         frames.set(0); imu.set(0); rssi.set(0)
 
-        File(dir, "meta.json").writeText(meta(size).toString(2))
+        File(dir, "meta.json").writeText(meta(size, capture, bin).toString(2))
+        // The calibration for exactly these frames, if this phone has one: a recording then stands alone.
+        File(context.filesDir, "vision/camera-${rig.label.replace('/', '-')}-${size.width}x${size.height}.json")
+            .takeIf { it.exists() }?.copyTo(File(dir, "calibration.json"), overwrite = true)
+        val binned = ByteArray(size.width * size.height)
         frameOut = BufferedOutputStream(FileOutputStream(File(dir, "frames.y8")), 1 shl 20)
         framesCsv = writer(dir, "frames.csv", "index,timestamp_ns")
         captureCsv = writer(dir, "capture.csv", "timestamp_ns,exposure_ns,rolling_shutter_skew_ns,frame_duration_ns,focus_diopters")
@@ -86,9 +93,10 @@ class Recorder(private val context: Context) {
 
         // Camera callbacks all run on the rig's one thread, so these writers aren't shared.
         rig.start(
-            size,
+            capture,
             onFrame = { f ->
-                frameOut?.write(f.luma)
+                binDown(f, bin, binned)
+                frameOut?.write(binned)
                 framesCsv?.println("${frames.getAndIncrement()},${f.timestampNs}")
             },
             onInfo = { i ->
@@ -145,12 +153,28 @@ class Recorder(private val context: Context) {
         override fun onAccuracyChanged(sensor: Sensor, accuracy: Int) = Unit
     }
 
+    /** Averages [bin]×[bin] blocks of [frame] into [out], which holds the smaller frame. */
+    private fun binDown(frame: LumaFrame, bin: Int, out: ByteArray) {
+        val width = frame.width / bin
+        val height = frame.height / bin
+        for (y in 0 until height) {
+            for (x in 0 until width) {
+                var sum = 0
+                for (dy in 0 until bin) {
+                    val row = (y * bin + dy) * frame.width + x * bin
+                    for (dx in 0 until bin) sum += frame.luma[row + dx].toInt() and 0xFF
+                }
+                out[y * width + x] = (sum / (bin * bin)).toByte()
+            }
+        }
+    }
+
     private fun writer(dir: File, name: String, header: String) =
         PrintWriter(File(dir, name).bufferedWriter()).apply { println(header) }
 
     private fun fail(message: String) = _stats.update { it.copy(error = message) }
 
-    private fun meta(size: Size): JSONObject {
+    private fun meta(size: Size, capture: Size, bin: Int): JSONObject {
         val c = rig.characteristics
         fun floats(key: CameraCharacteristics.Key<FloatArray>) = c?.get(key)?.let { JSONArray(it.map(Float::toDouble)) }
         val camera = JSONObject()
@@ -158,6 +182,8 @@ class Recorder(private val context: Context) {
             .put("physical_id", rig.physicalId)
             .put("width", size.width)
             .put("height", size.height)
+            .put("capture", "${capture.width}x${capture.height}")
+            .put("binning", bin)
             .put("intrinsic_calibration_fx_fy_cx_cy_s", floats(CameraCharacteristics.LENS_INTRINSIC_CALIBRATION))
             .put("distortion_k1k2k3p1p2", floats(CameraCharacteristics.LENS_DISTORTION))
             .put("pose_rotation_xyzw", floats(CameraCharacteristics.LENS_POSE_ROTATION))
