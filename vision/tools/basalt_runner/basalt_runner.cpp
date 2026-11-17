@@ -97,7 +97,10 @@ int main(int argc, char **argv) {
   vit_config_t vit_config{unified.c_str(), 2, 1, false};
   vit_tracker_t *tracker = nullptr;
   if (!check(vit_tracker_create(&vit_config, &tracker), "vit_tracker_create")) return 1;
+  // Features per pose: how many each camera tracks, and how deep Basalt thinks they are.
+  check(vit_tracker_enable_extension(tracker, VIT_TRACKER_EXTENSION_POSE_FEATURES, true), "enable pose features");
   if (!check(vit_tracker_start(tracker), "vit_tracker_start")) return 1;
+  int64_t next_report = 0;
 
   std::ofstream out(trajectory);
   out << "#t_ns,px,py,pz,qx,qy,qz,qw\n";
@@ -108,6 +111,21 @@ int main(int argc, char **argv) {
       vit_pose_data_t d;
       if (vit_pose_get_data(pose, &d) == VIT_SUCCESS) {
         poses.push_back(d);
+        if (d.timestamp >= next_report) {
+          next_report = d.timestamp + 1'000'000'000;
+          std::printf("t=%6.1f s  pos (%+.2f %+.2f %+.2f)", (d.timestamp - poses.front().timestamp) / 1e9, d.px, d.py, d.pz);
+          for (uint32_t cam = 0; cam < 2; cam++) {
+            vit_pose_features_t features{};
+            if (vit_pose_get_features(pose, cam, &features) != VIT_SUCCESS) continue;
+            std::vector<float> depths;
+            for (uint32_t i = 0; i < features.count; i++)
+              if (features.features[i].depth > 0) depths.push_back(features.features[i].depth);
+            std::sort(depths.begin(), depths.end());
+            std::printf("  cam%u %3u features, %3zu with depth (median %.2f m)", cam, features.count, depths.size(),
+                        depths.empty() ? 0.0 : depths[depths.size() / 2]);
+          }
+          std::printf("\n");
+        }
         out << d.timestamp << ',' << d.px << ',' << d.py << ',' << d.pz << ',' << d.ox << ',' << d.oy << ',' << d.oz
             << ',' << d.ow << '\n';
       }
