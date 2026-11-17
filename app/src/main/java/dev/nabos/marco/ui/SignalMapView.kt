@@ -6,6 +6,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.clipRect
@@ -24,13 +25,14 @@ import kotlin.math.roundToInt
 /**
  * The signal map seen from above, turned so the way you face is up, centred
  * on you: where the other phone likely is (warmer = likelier), your path, and
- * the most likely spot ringed by how sure the map is. Rings every metre.
+ * the most likely spot ringed by how sure the map is. Rings every metre. You
+ * are the arrow, in [youColor]: the hot/cold reading.
  */
 @Composable
-fun SignalMapView(m: MapState, modifier: Modifier) {
+fun SignalMapView(m: MapState, youColor: Color, modifier: Modifier) {
     val ring = MaterialTheme.colorScheme.outlineVariant
     val trail = MaterialTheme.colorScheme.primary
-    val you = MaterialTheme.colorScheme.onSurface
+    val you = youColor
     Canvas(modifier) {
         val here = m.here ?: return@Canvas
         val e = m.estimate

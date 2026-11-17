@@ -36,6 +36,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -100,6 +101,9 @@ class FinderViewModel(app: Application) : AndroidViewModel(app) {
         map.stop()
     }
 
+    /** The map is the main tool: it starts by itself once, unless turned off or refused. */
+    var mapOffered = false
+
     override fun onCleared() {
         stopRecording()
         map.stop()
@@ -122,6 +126,18 @@ fun FindScreen(modifier: Modifier, peer: Peer, onBack: () -> Unit) {
     val mapping = m.running
     val context = LocalContext.current
     val askCamera = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { if (it) vm.startMap() }
+    val startMap = {
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) vm.startMap()
+        else askCamera.launch(Manifest.permission.CAMERA)
+    }
+    // The map can't run: no calibrated camera, or no camera permission.
+    val mapUsable = mapping && m.track.error == null
+    LaunchedEffect(peer.id) {
+        if (vm.map.available && !vm.mapOffered) {
+            vm.mapOffered = true
+            startMap()
+        }
+    }
 
     // Scan only while this screen is visible, and keep the screen on meanwhile
     // (Android stops delivering unfiltered scan results when the screen is off).
@@ -157,8 +173,17 @@ fun FindScreen(modifier: Modifier, peer: Peer, onBack: () -> Unit) {
 
         Text(phaseLine(s), style = MaterialTheme.typography.bodyMedium, textAlign = TextAlign.Center)
 
-        if (mapping) {
-            SignalMapView(m, Modifier.fillMaxWidth().weight(1f))
+        if (mapUsable) {
+            Box(Modifier.fillMaxWidth().weight(1f)) {
+                SignalMapView(m, youColor = if (s.stale) MaterialTheme.colorScheme.onSurface else lerp(COLD, HOT, s.level), Modifier.fillMaxSize())
+                // The hot/cold reading, small, while the map is the main thing.
+                Text(
+                    heatChip(s),
+                    Modifier.align(Alignment.TopStart),
+                    style = MaterialTheme.typography.labelLarge,
+                    color = if (s.stale) MaterialTheme.colorScheme.onSurfaceVariant else lerp(COLD, HOT, s.level),
+                )
+            }
             Text(mapHeadline(m), fontSize = 32.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
             Text(mapDetail(m), style = MaterialTheme.typography.bodyMedium, textAlign = TextAlign.Center)
         } else if (pointing) {
@@ -173,27 +198,24 @@ fun FindScreen(modifier: Modifier, peer: Peer, onBack: () -> Unit) {
                 fontWeight = FontWeight.Bold,
                 color = if (s.stale) MaterialTheme.colorScheme.onSurfaceVariant else lerp(COLD, HOT, s.level),
             )
-            Text(detailLine(s), style = MaterialTheme.typography.bodyMedium)
+            Text(detailLine(s), style = MaterialTheme.typography.bodyMedium, textAlign = TextAlign.Center)
+            // Why the map isn't on, when it could be.
+            m.track.error?.let { Text(it, style = MaterialTheme.typography.bodySmall, textAlign = TextAlign.Center) }
         }
 
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            if (pointing || mapping) {
-                OutlinedButton(onClick = vm::hotCold, modifier = Modifier.weight(1f)) { Text("Hot/cold") }
+        // The other tools, small: the map is the one to use.
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
+            if (!mapUsable && vm.map.available && m.track.error == null) {
+                TextButton(onClick = startMap) { Text("Map") }
             }
             if (!pointing && !p.unsupported) {
-                OutlinedButton(onClick = vm::startPointing, modifier = Modifier.weight(1f)) { Text("Point at it") }
+                TextButton(onClick = vm::startPointing) { Text("Point at it") }
             }
             if (p.phase == PointPhase.DONE) {
-                OutlinedButton(onClick = vm.point::restartSweep, modifier = Modifier.weight(1f)) { Text("Sweep again") }
+                TextButton(onClick = vm.point::restartSweep) { Text("Sweep again") }
             }
-            if (!mapping && vm.map.available) {
-                OutlinedButton(
-                    onClick = {
-                        if (ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) vm.startMap()
-                        else askCamera.launch(Manifest.permission.CAMERA)
-                    },
-                    modifier = Modifier.weight(1f),
-                ) { Text("Map") }
+            if (pointing || mapping) {
+                TextButton(onClick = vm::hotCold) { Text("Hot/cold") }
             }
         }
 
@@ -310,7 +332,13 @@ private fun heatLabel(s: FinderState): String {
 
 private fun detailLine(s: FinderState): String {
     val r = s.rssi ?: return "Walk around slowly. Hold the phone in front of you."
-    return "${r.roundToInt()} dBm (raw ${s.rawRssi}) · tap Point at it to find the direction"
+    return "${r.roundToInt()} dBm (raw ${s.rawRssi})"
+}
+
+/** The hot/cold reading in a few characters, for the map's corner. */
+private fun heatChip(s: FinderState): String {
+    val r = s.rssi ?: return "…"
+    return "${heatLabel(s)} · ${r.roundToInt()} dBm"
 }
 
 private fun phaseLine(s: FinderState): String = when (s.phase) {
