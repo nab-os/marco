@@ -129,6 +129,11 @@ class Calibrator(private val context: Context) {
         size = s
         val fov = rig.horizontalFovDeg()
         val saved = runCatching { JSONObject(savedFile.readText()) }.getOrNull()
+        // Before the worker starts: it may report the saved calibration right away.
+        _state.value = CalibrationState(
+            running = true,
+            cameraLabel = "camera ${rig.label} · ${s.width}×${s.height}" + (fov?.let { " · %.0f° wide".format(it) } ?: ""),
+        )
         worker.execute {
             handle = Vernier.newSession(true)
             lastKeepNs = 0
@@ -137,10 +142,6 @@ class Calibrator(private val context: Context) {
                 _state.update { it.copy(result = runCatching { result(saved, savedFile, saved = true) }.getOrNull()) }
             }
         }
-        _state.value = CalibrationState(
-            running = true,
-            cameraLabel = "camera ${rig.label} · ${s.width}×${s.height}" + (fov?.let { " · %.0f° wide".format(it) } ?: ""),
-        )
         rig.start(
             s,
             onFrame = { frame ->
@@ -196,7 +197,7 @@ class Calibrator(private val context: Context) {
         val thread = HandlerThread("marco-gyro").also { it.start() }
         gyroThread = thread
         gyroCount = 0
-        sensors.registerListener(gyroListener, gyro, SensorManager.SENSOR_DELAY_FASTEST, Handler(thread.looper))
+        sensors.registerListener(gyroListener, gyro, IMU_PERIOD_US, Handler(thread.looper))
     }
 
     fun align() {

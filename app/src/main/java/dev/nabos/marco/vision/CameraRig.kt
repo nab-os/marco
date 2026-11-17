@@ -23,6 +23,12 @@ import kotlin.math.atan
 import kotlin.math.max
 import kotlin.math.roundToInt
 
+/**
+ * Motion sensor period, µs: 200 Hz, the fastest Android 12+ allows without the
+ * HIGH_SAMPLING_RATE_SENSORS permission (SENSOR_DELAY_FASTEST throws without it).
+ */
+const val IMU_PERIOD_US = 5_000
+
 /** One grey frame, rows packed (`width` bytes each), [timestampNs] on the elapsedRealtime clock. */
 class LumaFrame(val luma: ByteArray, val width: Int, val height: Int, val timestampNs: Long)
 

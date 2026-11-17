@@ -101,7 +101,7 @@ class Recorder(private val context: Context) {
         sensorThread = t
         val handler = Handler(t.looper)
         listOfNotNull(sensors.getDefaultSensor(Sensor.TYPE_GYROSCOPE), sensors.getDefaultSensor(Sensor.TYPE_ACCELEROMETER))
-            .forEach { sensors.registerListener(imuListener, it, SensorManager.SENSOR_DELAY_FASTEST, handler) }
+            .forEach { sensors.registerListener(imuListener, it, IMU_PERIOD_US, handler) }
 
         if (samples != null) {
             rssiCsv = writer(dir, "rssi.csv", "timestamp_ns,rssi_dbm,connection")
