@@ -54,15 +54,19 @@ data class RecorderStats(
  * - `rssi.csv`: `timestamp_ns,rssi_dbm,connection` (1: GATT connection, 0: advert).
  * - `meta.json`: device, camera factory calibration and pose, sensors.
  * - `calibration.json`: this camera's calibration and gyroscope alignment, if one was made.
+ * - `frames1.y8`, `frames1.csv`, `capture1.csv`: the same for the camera's second lens, when it
+ *   has one (captured at 640×480, binned to 320×240): with lens 0, a stereo pair for Basalt.
  */
 class Recorder(private val context: Context) {
 
     private val rig = CameraRig(context)
     private val sensors = context.getSystemService(SensorManager::class.java)
     private var sensorThread: HandlerThread? = null
-    private var frameOut: BufferedOutputStream? = null
-    private var framesCsv: PrintWriter? = null
-    private var captureCsv: PrintWriter? = null
+    /** Per lens. */
+    private val frameOut = arrayOfNulls<BufferedOutputStream>(2)
+    private val framesCsv = arrayOfNulls<PrintWriter>(2)
+    private val captureCsv = arrayOfNulls<PrintWriter>(2)
+    private val lensFrames = listOf(AtomicInteger(), AtomicInteger())
     private var imuCsv: PrintWriter? = null
     private var rssiCsv: PrintWriter? = null
     private val frames = AtomicInteger()
@@ -76,31 +80,37 @@ class Recorder(private val context: Context) {
     fun start(scope: CoroutineScope, samples: Flow<RssiSample>? = null, captureWidth: Int = 1280, bin: Int = 2) {
         if (_stats.value.recording) return
         val capture = rig.outputSize(captureWidth) ?: return fail("No 4:3 camera stream up to $captureWidth px wide.")
+        val captures = listOfNotNull(capture, rig.secondOutputSize(Calibrator.SECOND_CAPTURE_WIDTH))
         val size = Size(capture.width / bin, capture.height / bin)
         val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
         val dir = File(context.getExternalFilesDir("recordings"), stamp).apply { mkdirs() }
         frames.set(0); imu.set(0); rssi.set(0)
+        lensFrames.forEach { it.set(0) }
 
-        File(dir, "meta.json").writeText(meta(size, capture, bin).toString(2))
+        File(dir, "meta.json").writeText(meta(size, capture, bin, captures.getOrNull(1)).toString(2))
         // The calibration for exactly these frames, if this phone has one: a recording then stands alone.
         File(context.filesDir, "vision/camera-${rig.label.replace('/', '-')}-${size.width}x${size.height}.json")
             .takeIf { it.exists() }?.copyTo(File(dir, "calibration.json"), overwrite = true)
-        val binned = ByteArray(size.width * size.height)
-        frameOut = BufferedOutputStream(FileOutputStream(File(dir, "frames.y8")), 1 shl 20)
-        framesCsv = writer(dir, "frames.csv", "index,timestamp_ns")
-        captureCsv = writer(dir, "capture.csv", "timestamp_ns,exposure_ns,rolling_shutter_skew_ns,frame_duration_ns,focus_diopters")
+        val binned = captures.map { ByteArray(it.width / bin * (it.height / bin)) }
+        captures.indices.forEach { lens ->
+            val suffix = if (lens == 0) "" else "$lens"
+            frameOut[lens] = BufferedOutputStream(FileOutputStream(File(dir, "frames$suffix.y8")), 1 shl 20)
+            framesCsv[lens] = writer(dir, "frames$suffix.csv", "index,timestamp_ns")
+            captureCsv[lens] = writer(dir, "capture$suffix.csv", "timestamp_ns,exposure_ns,rolling_shutter_skew_ns,frame_duration_ns,focus_diopters")
+        }
         imuCsv = writer(dir, "imu.csv", "timestamp_ns,sensor,x,y,z")
 
         // Camera callbacks all run on the rig's one thread, so these writers aren't shared.
-        rig.start(
-            capture,
-            onFrame = { f ->
-                binDown(f, bin, binned)
-                frameOut?.write(binned)
-                framesCsv?.println("${frames.getAndIncrement()},${f.timestampNs}")
+        rig.startLenses(
+            captures,
+            onFrame = { lens, f ->
+                binDown(f, bin, binned[lens])
+                frameOut[lens]?.write(binned[lens])
+                framesCsv[lens]?.println("${lensFrames[lens].getAndIncrement()},${f.timestampNs}")
+                if (lens == 0) frames.incrementAndGet()
             },
-            onInfo = { i ->
-                captureCsv?.println("${i.timestampNs},${i.exposureNs ?: ""},${i.rollingShutterSkewNs ?: ""},${i.frameDurationNs ?: ""},${i.focusDiopters ?: ""}")
+            onInfo = { lens, i ->
+                captureCsv[lens]?.println("${i.timestampNs},${i.exposureNs ?: ""},${i.rollingShutterSkewNs ?: ""},${i.frameDurationNs ?: ""},${i.focusDiopters ?: ""}")
             },
             onError = ::fail,
         )
@@ -138,8 +148,8 @@ class Recorder(private val context: Context) {
         jobs.forEach { it.cancel() }
         jobs.clear()
         // Both threads have finished: nothing writes to these any more.
-        listOf(frameOut, framesCsv, captureCsv, imuCsv, rssiCsv).forEach { runCatching { it?.close() } }
-        frameOut = null; framesCsv = null; captureCsv = null; imuCsv = null; rssiCsv = null
+        (frameOut.toList() + framesCsv + captureCsv + listOf(imuCsv, rssiCsv)).forEach { runCatching { it?.close() } }
+        frameOut.fill(null); framesCsv.fill(null); captureCsv.fill(null); imuCsv = null; rssiCsv = null
         _stats.update { it.copy(recording = false, frames = frames.get(), imu = imu.get(), rssi = rssi.get()) }
     }
 
@@ -174,7 +184,7 @@ class Recorder(private val context: Context) {
 
     private fun fail(message: String) = _stats.update { it.copy(error = message) }
 
-    private fun meta(size: Size, capture: Size, bin: Int): JSONObject {
+    private fun meta(size: Size, capture: Size, bin: Int, secondCapture: Size?): JSONObject {
         val c = rig.characteristics
         fun floats(key: CameraCharacteristics.Key<FloatArray>) = c?.get(key)?.let { JSONArray(it.map(Float::toDouble)) }
         val camera = JSONObject()
@@ -214,6 +224,10 @@ class Recorder(private val context: Context) {
             .put("frames_format", "y8")
             .put("camera", camera)
             .put("imu", sensorInfo)
+            .put("second", secondCapture?.let {
+                JSONObject().put("id", rig.secondId).put("width", it.width / bin).put("height", it.height / bin)
+                    .put("capture", "${it.width}x${it.height}").put("binning", bin)
+            })
             .put("display", JSONObject().put("width_px", display.widthPixels).put("height_px", display.heightPixels)
                 .put("xdpi", display.xdpi.toDouble()).put("ydpi", display.ydpi.toDouble()))
     }

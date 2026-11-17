@@ -9,8 +9,13 @@ RECORDING_DIR is a folder the Lab's recorder wrote (adb pull
 the EuRoC layout Basalt reads, and calib.json:
 
     OUT_DIR/mav0/cam0/data.csv, OUT_DIR/mav0/cam0/data/<t_ns>.png
+    OUT_DIR/mav0/cam1/...          (the second lens, if recorded and calibrated)
     OUT_DIR/mav0/imu0/data.csv
     OUT_DIR/calib.json
+
+Basalt is stereo-only: the phone's second back lens (the main one, beside the
+ultrawide) makes cam1. Only frames both lenses took in the same capture are
+kept, both stamped like cam0's.
 
 Timing: a frame is stamped at the middle of its middle row's exposure, then
 moved onto the gyroscope's clock by the calibration's measured offset, so
@@ -45,14 +50,23 @@ def png(path: Path, width: int, height: int, grey: bytes) -> None:
     )
 
 
-def frame_times(recording: Path) -> list[tuple[int, int]]:
-    """(index, sensor timestamp ns) per frame in frames.y8."""
-    with open(recording / "frames.csv") as f:
+def frame_times(recording: Path, lens: int = 0) -> list[tuple[int, int]]:
+    """(index, sensor timestamp ns) per frame in frames.y8 (lens 1: frames1.y8)."""
+    with open(recording / ("frames.csv" if lens == 0 else f"frames{lens}.csv")) as f:
         return [(int(r["index"]), int(r["timestamp_ns"])) for r in csv.DictReader(f)]
 
 
+def nearest(info: dict[int, tuple[int, int]], t: int, within: int = 15_000_000) -> tuple[int, int]:
+    """The capture info nearest `t`: each lens's result carries its own sensor's timestamp,
+    a fraction of a millisecond from the frames' shared one."""
+    if t in info:
+        return info[t]
+    best = min(info, key=lambda k: abs(k - t), default=None)
+    return info[best] if best is not None and abs(best - t) <= within else (0, 0)
+
+
 def capture_info(recording: Path) -> dict[int, tuple[int, int]]:
-    """Sensor timestamp → (exposure ns, rolling shutter skew ns)."""
+    """Sensor timestamp → (exposure ns, rolling shutter skew ns), for lens 0."""
     info = {}
     path = recording / "capture.csv"
     if path.exists():
@@ -83,36 +97,68 @@ def imu_rows(recording: Path) -> list[tuple[int, list[float], list[float]]]:
     return rows
 
 
-def basalt_calibration(calibration: dict, width: int, height: int) -> dict:
-    camera = calibration["camera"]
+def quat_mul(a, b):
+    ax, ay, az, aw = a
+    bx, by, bz, bw = b
+    return (aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw,
+            aw * bw - ax * bx - ay * by - az * bz)
+
+
+def quat_conj(q):
+    return (-q[0], -q[1], -q[2], q[3])
+
+
+def quat_rotate(q, v):
+    x, y, z, _ = quat_mul(quat_mul(q, (v[0], v[1], v[2], 0.0)), quat_conj(q))
+    return (x, y, z)
+
+
+def basalt_intrinsics(camera: dict, width: int, height: int) -> dict:
     if (camera["width"], camera["height"]) != (width, height):
         sys.exit(f"calibration is for {camera['width']}x{camera['height']}, frames are {width}x{height}")
     base = {k: camera[k] for k in ("fx", "fy", "cx", "cy")}
     d = camera["distortion"]
     if camera["model"] == "fisheye":
-        intrinsics = {"camera_type": "kb4", "intrinsics": {**base, "k1": d[0], "k2": d[1], "k3": d[2], "k4": d[3]}}
-    else:
-        # Vernier's pinhole is OpenCV's k1 k2 p1 p2 k3; radtan8 adds k4..k6 and the
-        # largest normalised radius it is valid to: the frame's corners, with room.
-        corners = [((u - camera["cx"]) / camera["fx"], (v - camera["cy"]) / camera["fy"])
-                   for u in (0, width) for v in (0, height)]
-        rpmax = 1.2 * max(math.hypot(x, y) for x, y in corners)
-        intrinsics = {"camera_type": "pinhole-radtan8", "intrinsics": {
-            **base, "k1": d[0], "k2": d[1], "p1": d[2], "p2": d[3], "k3": d[4],
-            "k4": 0.0, "k5": 0.0, "k6": 0.0, "rpmax": rpmax}}
+        return {"camera_type": "kb4", "intrinsics": {**base, "k1": d[0], "k2": d[1], "k3": d[2], "k4": d[3]}}
+    # Vernier's pinhole is OpenCV's k1 k2 p1 p2 k3; radtan8 adds k4..k6, and rpmax -1 for no limit.
+    return {"camera_type": "pinhole-radtan8", "intrinsics": {
+        **base, "k1": d[0], "k2": d[1], "p1": d[2], "p2": d[3], "k3": d[4],
+        "k4": 0.0, "k5": 0.0, "k6": 0.0, "rpmax": -1}}
 
+
+def basalt_calibration(calibration: dict, sizes: list[tuple[int, int]]) -> dict:
+    intrinsics = [basalt_intrinsics(calibration["camera"], *sizes[0])]
     imu = calibration.get("imu")
     if imu is None:
         sys.exit("the calibration has no gyroscope alignment (imu): calibrate again with a gyroscope")
     # Marco gives the rotation taking gyro axes to camera axes; Basalt wants the
     # camera's pose in the IMU frame (camera points to IMU points): its inverse.
-    x, y, z, w = imu["imu_to_camera_xyzw"]
+    imu_cam0 = quat_conj(tuple(imu["imu_to_camera_xyzw"]))
+
+    def pose(q, p):
+        return {"px": p[0], "py": p[1], "pz": p[2], "qx": q[0], "qy": q[1], "qz": q[2], "qw": q[3]}
+
+    # The lever arm between gyroscope and camera (a cm or two) isn't measured.
+    T_imu_cam = [pose(imu_cam0, (0.0, 0.0, 0.0))]
+    if len(sizes) > 1:
+        stereo = calibration["stereo"]
+        if "translation_m" not in stereo:
+            sys.exit("the stereo calibration has no metric baseline (translation_m)")
+        intrinsics.append(basalt_intrinsics(calibration["second"]["camera"], *sizes[1]))
+        # Vernier: x_cam1 = R x_cam0 + t. Basalt wants cam1's pose in the IMU frame:
+        # T_imu_cam1 = T_imu_cam0 · T_cam0_cam1, with T_cam0_cam1 = (Rᵀ, −Rᵀ t).
+        r = tuple(stereo["second_from_first_xyzw"])
+        r_inv = quat_conj(r)
+        t = stereo["translation_m"]
+        cam0_cam1_p = tuple(-c for c in quat_rotate(r_inv, t))
+        T_imu_cam.append(pose(quat_mul(imu_cam0, r_inv), quat_rotate(imu_cam0, cam0_cam1_p)))
     identity = {"px": 0.0, "py": 0.0, "pz": 0.0, "qx": 0.0, "qy": 0.0, "qz": 0.0, "qw": 1.0}
     return {"value0": {
-        # The lever arm between gyroscope and camera (a cm or two) isn't measured.
-        "T_imu_cam": [{"px": 0.0, "py": 0.0, "pz": 0.0, "qx": -x, "qy": -y, "qz": -z, "qw": w}],
-        "intrinsics": [intrinsics],
-        "resolution": [[width, height]],
+        "T_imu_cam": T_imu_cam,
+        "intrinsics": intrinsics,
+        "resolution": [list(size) for size in sizes],
         "calib_accel_bias": [0.0] * 9,
         "calib_gyro_bias": [0.0] * 12,
         "imu_update_rate": 200.0,
@@ -121,7 +167,7 @@ def basalt_calibration(calibration: dict, width: int, height: int) -> dict:
         "gyro_noise_std": [0.002, 0.002, 0.002],
         "accel_bias_std": [0.001, 0.001, 0.001],
         "gyro_bias_std": [0.0001, 0.0001, 0.0001],
-        "T_mocap_imu": identity,
+        "T_mocap_world": identity,
         "T_imu_marker": identity,
         "mocap_time_offset_ns": 0,
         "mocap_to_imu_offset_ns": 0,
@@ -140,36 +186,52 @@ def main() -> None:
 
     meta = json.loads((args.recording / "meta.json").read_text())
     width, height = meta["camera"]["width"], meta["camera"]["height"]
+    sizes = [(width, height)]
     calibration_path = args.calibration or args.recording / "calibration.json"
     if not calibration_path.exists():
         sys.exit(f"no calibration at {calibration_path}: pass --calibration")
     calibration = json.loads(calibration_path.read_text())
     offset_ns = round(calibration.get("imu", {}).get("time_offset_ms", 0.0) * 1e6)
+    second = meta.get("second")
+    stereo = second is not None and "stereo" in calibration and (args.recording / "frames1.y8").exists()
+    if stereo:
+        sizes.append((second["width"], second["height"]))
+    elif second is not None:
+        print("the recording has a second lens but the calibration has no stereo pose: writing cam0 only")
 
-    images = args.out / "mav0" / "cam0" / "data"
-    images.mkdir(parents=True, exist_ok=True)
     (args.out / "mav0" / "imu0").mkdir(parents=True, exist_ok=True)
-    (args.out / "calib.json").write_text(json.dumps(basalt_calibration(calibration, width, height), indent=2))
+    (args.out / "calib.json").write_text(json.dumps(basalt_calibration(calibration, sizes), indent=2))
 
     info = capture_info(args.recording)
-    size = width * height
-    written = 0
-    with open(args.recording / "frames.y8", "rb") as raw, open(args.out / "mav0" / "cam0" / "data.csv", "w") as out:
+    lenses = [dict(frame_times(args.recording, lens)) for lens in range(len(sizes))]
+    by_time = [{t: i for i, t in lens.items()} for lens in lenses]
+    shared = sorted(set(by_time[0]).intersection(*by_time[1:]))
+    raws = [open(args.recording / ("frames.y8" if lens == 0 else f"frames{lens}.y8"), "rb") for lens in range(len(sizes))]
+    outs = []
+    for lens in range(len(sizes)):
+        (args.out / "mav0" / f"cam{lens}" / "data").mkdir(parents=True, exist_ok=True)
+        out = open(args.out / "mav0" / f"cam{lens}" / "data.csv", "w")
         out.write("#timestamp [ns],filename\n")
-        last = None
-        for index, sensor_ns in frame_times(args.recording):
-            raw.seek(index * size)
-            grey = raw.read(size)
-            if len(grey) < size:
-                break
-            exposure, skew = info.get(sensor_ns, (0, 0))
-            t = sensor_ns + exposure // 2 + skew // 2 + offset_ns
-            if last is not None and t <= last:
-                continue
-            last = t
-            png(images / f"{t}.png", width, height, grey)
-            out.write(f"{t},{t}.png\n")
-            written += 1
+        outs.append(out)
+    written, last = 0, None
+    for sensor_ns in shared:
+        exposure, skew = nearest(info, sensor_ns)
+        t = sensor_ns + exposure // 2 + skew // 2 + offset_ns
+        if last is not None and t <= last:
+            continue
+        frames = []
+        for lens, (w, h) in enumerate(sizes):
+            raws[lens].seek(by_time[lens][sensor_ns] * w * h)
+            frames.append(raws[lens].read(w * h))
+        if any(len(f) < w * h for f, (w, h) in zip(frames, sizes)):
+            break
+        last = t
+        for lens, ((w, h), grey) in enumerate(zip(sizes, frames)):
+            png(args.out / "mav0" / f"cam{lens}" / "data" / f"{t}.png", w, h, grey)
+            outs[lens].write(f"{t},{t}.png\n")
+        written += 1
+    for f in raws + outs:
+        f.close()
 
     rows = imu_rows(args.recording)
     with open(args.out / "mav0" / "imu0" / "data.csv", "w") as out:
@@ -178,8 +240,9 @@ def main() -> None:
         for t, w, a in rows:
             out.write(f"{t},{w[0]:.9g},{w[1]:.9g},{w[2]:.9g},{a[0]:.9g},{a[1]:.9g},{a[2]:.9g}\n")
 
-    missing = sum(1 for _, t in frame_times(args.recording) if t not in info)
-    print(f"{written} frames {width}x{height}, {len(rows)} IMU rows, camera moved {offset_ns / 1e6:+.2f} ms onto the IMU clock"
+    missing = sum(1 for t in shared if nearest(info, t) == (0, 0))
+    print(f"{written} {'stereo pairs' if stereo else 'frames'} " + " + ".join(f"{w}x{h}" for w, h in sizes)
+          + f", {len(rows)} IMU rows, camera moved {offset_ns / 1e6:+.2f} ms onto the IMU clock"
           + (f"; {missing} frames had no exposure info" if missing else ""))
 
 
