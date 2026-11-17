@@ -1,0 +1,267 @@
+package dev.nabos.marco.finder
+
+import kotlin.math.exp
+import kotlin.math.hypot
+import kotlin.math.log10
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.sqrt
+
+/**
+ * The continuous signal map: RSSI readings taken where the camera tracking put
+ * you, and which way you faced, fitted to where the other phone would explain
+ * them best.
+ *
+ * Each candidate spot on a grid around your path is scored with a log-distance
+ * path loss model, `rssi = A − 10·n·log10(d) − B·behind`: `A` the level at 1 m
+ * (one per source, advert and connection readings differ), `n` how fast it
+ * fades, and `B` what your body takes off when the spot is behind you (`behind`
+ * goes from 0 facing it to 1 with your back to it, as in [DirectionSweep]).
+ * `A` is solved per spot, `n` and `B` picked from a few values; the score is how
+ * well the best of them fits, turned into a probability over the grid.
+ *
+ * A gradient in signal strength tells the direction much better than the
+ * distance, so two weak priors keep the far end of the grid from adding up:
+ * `A` near what phones read at 1 m, and the phone more likely near where you
+ * search than far beyond it.
+ *
+ * Readings are averaged per half-metre cell and heading sector first: fading
+ * changes within centimetres, and many readings from one spot are not many
+ * independent ones.
+ *
+ * Coordinates are metres in the tracking's world (z up, so x/y are the floor).
+ * Readings may be added while an estimate is being made on another thread.
+ */
+class SignalMap {
+
+    /** One reading where it was taken: position, the horizontal way the camera faced (unit or zero). */
+    data class Reading(val x: Double, val y: Double, val headingX: Double, val headingY: Double, val rssi: Int, val fromConnection: Boolean)
+
+    data class Estimate(
+        /** The most likely spot. */
+        val x: Double,
+        val y: Double,
+        /** The radius around that spot holding two thirds of the probability, metres: how sure it is. */
+        val spreadM: Double,
+        /** The grid: cell (col, row) is centred at `originX + col·cellM, originY + row·cellM`. */
+        val originX: Double,
+        val originY: Double,
+        val cellM: Double,
+        val cols: Int,
+        val rows: Int,
+        /** Probability per cell, row-major, summing to 1. */
+        val probability: FloatArray,
+        /** Fitted fading exponent and body loss at the most likely spot. */
+        val exponent: Double,
+        val bodyDb: Double,
+        val readings: Int,
+    )
+
+    private class Bin(val fromConnection: Boolean) {
+        var n = 0
+        var x = 0.0
+        var y = 0.0
+        var hx = 0.0
+        var hy = 0.0
+        var rssi = 0.0
+
+        fun add(r: Reading) {
+            n++
+            x += (r.x - x) / n
+            y += (r.y - y) / n
+            hx += (r.headingX - hx) / n
+            hy += (r.headingY - hy) / n
+            rssi += (r.rssi - rssi) / n
+        }
+
+        fun snapshot() = Bin(fromConnection).also {
+            it.n = n
+            it.x = x
+            it.y = y
+            it.hx = hx
+            it.hy = hy
+            it.rssi = rssi
+        }
+    }
+
+    private val bins = HashMap<Long, Bin>()
+    @Volatile var readings = 0
+        private set
+
+    @Synchronized fun add(r: Reading) {
+        val ix = kotlin.math.floor(r.x / BIN_M).toLong()
+        val iy = kotlin.math.floor(r.y / BIN_M).toLong()
+        val angle = kotlin.math.atan2(r.headingY, r.headingX)
+        val sector = (((angle / (2 * Math.PI) + 1.0) * SECTORS).toInt() % SECTORS).toLong()
+        val key = (((ix and 0xFFFFF) shl 24) or ((iy and 0xFFFFF) shl 4) or sector) * 2 + if (r.fromConnection) 1 else 0
+        bins.getOrPut(key) { Bin(r.fromConnection) }.add(r)
+        readings++
+    }
+
+    @Synchronized fun clear() {
+        bins.clear()
+        readings = 0
+    }
+
+    /** Null until there are enough readings from enough places to say anything. */
+    fun estimate(): Estimate? {
+        val (list, readings) = synchronized(this) {
+            bins.values.map(Bin::snapshot) to readings
+        }
+        if (readings < MIN_READINGS || list.size < MIN_BINS) return null
+        val minX = list.minOf { it.x } - MARGIN_M
+        val maxX = list.maxOf { it.x } + MARGIN_M
+        val minY = list.minOf { it.y } - MARGIN_M
+        val maxY = list.maxOf { it.y } + MARGIN_M
+        val cell = max(MIN_CELL_M, max(maxX - minX, maxY - minY) / MAX_CELLS)
+        val cols = ((maxX - minX) / cell).toInt() + 1
+        val rows = ((maxY - minY) / cell).toInt() + 1
+
+        val count = list.size
+        val bx = DoubleArray(count) { list[it].x }
+        val by = DoubleArray(count) { list[it].y }
+        val bhx = DoubleArray(count) { list[it].hx }
+        val bhy = DoubleArray(count) { list[it].hy }
+        val br = DoubleArray(count) { list[it].rssi }
+        val bw = DoubleArray(count) { min(list[it].n, WEIGHT_CAP).toDouble() }
+        val bs = IntArray(count) { if (list[it].fromConnection) 1 else 0 }
+
+        // Per source, the sums that don't depend on the spot.
+        val w = DoubleArray(2)
+        val wr = DoubleArray(2)
+        val wrr = DoubleArray(2)
+        for (i in 0 until count) {
+            w[bs[i]] += bw[i]
+            wr[bs[i]] += bw[i] * br[i]
+            wrr[bs[i]] += bw[i] * br[i] * br[i]
+        }
+
+        val logLikelihood = DoubleArray(cols * rows)
+        val bestN = DoubleArray(cols * rows)
+        val bestB = DoubleArray(cols * rows)
+        val wl = DoubleArray(2)
+        val wll = DoubleArray(2)
+        val wrl = DoubleArray(2)
+        val wb = DoubleArray(2)
+        val wbb = DoubleArray(2)
+        val wrb = DoubleArray(2)
+        val wlb = DoubleArray(2)
+        for (row in 0 until rows) for (col in 0 until cols) {
+            val cx = minX + col * cell
+            val cy = minY + row * cell
+            wl.fill(0.0); wll.fill(0.0); wrl.fill(0.0); wb.fill(0.0); wbb.fill(0.0); wrb.fill(0.0); wlb.fill(0.0)
+            for (i in 0 until count) {
+                val dx = cx - bx[i]
+                val dy = cy - by[i]
+                val flat = hypot(dx, dy)
+                val l = 10 * log10(sqrt(flat * flat + HEIGHT_M * HEIGHT_M))
+                // 0 facing the spot, 1 with your back to it; ½ when the heading is unknown or the spot is right here.
+                val facing = if (flat > 1e-6) (bhx[i] * dx + bhy[i] * dy) / flat else 0.0
+                val b = (1 - facing) / 2
+                val s = bs[i]
+                val wi = bw[i]
+                wl[s] += wi * l
+                wll[s] += wi * l * l
+                wrl[s] += wi * br[i] * l
+                wb[s] += wi * b
+                wbb[s] += wi * b * b
+                wrb[s] += wi * br[i] * b
+                wlb[s] += wi * l * b
+            }
+            // rssi + n·l + B·b = A + error: for each n and B, A has a closed form (with its prior),
+            // and the squared error follows from the sums.
+            // In units of 2σ², so that the priors on n and B can join it.
+            var best = Double.MAX_VALUE
+            for (n in EXPONENTS) for (bodyDb in BODY_DB) {
+                val nOff = (n - N_PRIOR) / N_PRIOR_SD
+                val bOff = (bodyDb - BODY_PRIOR_DB) / BODY_PRIOR_SD_DB
+                var sse = (nOff * nOff + bOff * bOff) * SIGMA_DB * SIGMA_DB
+                for (s in 0..1) {
+                    if (w[s] == 0.0) continue
+                    val z1 = wr[s] + n * wl[s] + bodyDb * wb[s]
+                    val z2 = wrr[s] + n * n * wll[s] + bodyDb * bodyDb * wbb[s] +
+                        2 * n * wrl[s] + 2 * bodyDb * wrb[s] + 2 * n * bodyDb * wlb[s]
+                    val a = (z1 + A_PRIOR_WEIGHT * A_PRIOR_DBM) / (w[s] + A_PRIOR_WEIGHT)
+                    sse += z2 - 2 * a * z1 + a * a * w[s] + A_PRIOR_WEIGHT * (a - A_PRIOR_DBM) * (a - A_PRIOR_DBM)
+                }
+                if (sse < best) {
+                    best = sse
+                    bestN[row * cols + col] = n
+                    bestB[row * cols + col] = bodyDb
+                }
+            }
+            var nearest = Double.MAX_VALUE
+            for (i in 0 until count) nearest = min(nearest, hypot(cx - bx[i], cy - by[i]))
+            val beyond = max(0.0, nearest - NEAR_PATH_M) / FAR_SCALE_M
+            logLikelihood[row * cols + col] = -best / (2 * SIGMA_DB * SIGMA_DB) - beyond * beyond / 2
+        }
+
+        val top = logLikelihood.indices.maxBy { logLikelihood[it] }
+        val peak = logLikelihood[top]
+        val p = DoubleArray(logLikelihood.size) { exp(logLikelihood[it] - peak) }
+        val total = p.sum()
+        val ex = minX + (top % cols) * cell
+        val ey = minY + (top / cols) * cell
+        for (i in p.indices) p[i] /= total
+        val byDistance = p.indices.sortedBy { hypot(minX + (it % cols) * cell - ex, minY + (it / cols) * cell - ey) }
+        var mass = 0.0
+        var spread = 0.0
+        for (i in byDistance) {
+            mass += p[i]
+            if (mass >= SPREAD_MASS) {
+                spread = hypot(minX + (i % cols) * cell - ex, minY + (i / cols) * cell - ey)
+                break
+            }
+        }
+        return Estimate(
+            x = ex,
+            y = ey,
+            spreadM = spread,
+            originX = minX,
+            originY = minY,
+            cellM = cell,
+            cols = cols,
+            rows = rows,
+            probability = FloatArray(p.size) { p[it].toFloat() },
+            exponent = bestN[top],
+            bodyDb = bestB[top],
+            readings = readings,
+        )
+    }
+
+    companion object {
+        private const val BIN_M = 0.5
+        private const val SECTORS = 8
+        /** A cell's readings count as at most this many independent ones. */
+        private const val WEIGHT_CAP = 4
+        /** Spread of one reading around the model, dB: multipath fading indoors. */
+        private const val SIGMA_DB = 6.0
+        /** The level at 1 m, give or take 8 dB: phones read about −45 dBm right next to each other. */
+        private const val A_PRIOR_DBM = -58.0
+        /** That prior as a weight in readings: (σ / 8 dB)². */
+        private const val A_PRIOR_WEIGHT = (SIGMA_DB / 8.0) * (SIGMA_DB / 8.0)
+        private val EXPONENTS = doubleArrayOf(1.6, 1.9, 2.2, 2.5, 2.8, 3.1, 3.4)
+        private val BODY_DB = doubleArrayOf(0.0, 3.0, 6.0, 9.0, 12.0, 15.0)
+        /**
+         * Indoors at 2.4 GHz the exponent is about 2–3, and a body takes off about
+         * 5–10 dB ("point at it"). Left free, the body loss fits each stretch walked
+         * in one direction its own offset, and spots far off fit about as well.
+         */
+        private const val N_PRIOR = 2.4
+        private const val N_PRIOR_SD = 0.4
+        private const val BODY_PRIOR_DB = 7.0
+        private const val BODY_PRIOR_SD_DB = 3.0
+        /** The other phone is likely lower (floor, sofa, bag) than the one held in front of you. */
+        private const val HEIGHT_M = 0.6
+        /** How far past your path it may be. */
+        private const val MARGIN_M = 8.0
+        /** Within this of your path any spot is as likely; beyond, less so over [FAR_SCALE_M]. */
+        private const val NEAR_PATH_M = 2.0
+        private const val FAR_SCALE_M = 3.0
+        private const val SPREAD_MASS = 2.0 / 3
+        private const val MIN_CELL_M = 0.25
+        private const val MAX_CELLS = 80
+        const val MIN_READINGS = 20
+        private const val MIN_BINS = 4
+    }
+}

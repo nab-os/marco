@@ -59,17 +59,20 @@ import dev.nabos.marco.finder.FinderState
 import dev.nabos.marco.finder.LinkPhase
 import dev.nabos.marco.finder.PointAtIt
 import dev.nabos.marco.finder.PointPhase
+import dev.nabos.marco.finder.SignalMapSession
 import dev.nabos.marco.vision.Recorder
 import kotlin.math.roundToInt
 
 class FinderViewModel(app: Application) : AndroidViewModel(app) {
     val engine = FinderEngine(app, viewModelScope)
     val point = PointAtIt(app, viewModelScope, engine)
+    val map = SignalMapSession(app, viewModelScope, engine)
     private val recorderLazy = lazy { Recorder(app) }
     /** Debug builds only: records camera, motion and RSSI for tuning the signal map. */
     val recorder by recorderLazy
 
     fun startRecording() {
+        map.stop() // both need the cameras
         engine.fastPoll = true
         recorder.start(viewModelScope, engine.samples)
     }
@@ -80,8 +83,26 @@ class FinderViewModel(app: Application) : AndroidViewModel(app) {
         engine.fastPoll = point.state.value.phase != PointPhase.OFF
     }
 
+    fun startPointing() {
+        map.stop()
+        point.start()
+    }
+
+    fun startMap() {
+        stopRecording()
+        point.stop()
+        map.start()
+    }
+
+    /** Back to the hot/cold gauge. */
+    fun hotCold() {
+        point.stop()
+        map.stop()
+    }
+
     override fun onCleared() {
         stopRecording()
+        map.stop()
         point.stop()
         engine.stop()
     }
@@ -97,6 +118,10 @@ fun FindScreen(modifier: Modifier, peer: Peer, onBack: () -> Unit) {
     val s by vm.engine.state.collectAsStateWithLifecycle()
     val p by vm.point.state.collectAsStateWithLifecycle()
     val pointing = p.phase != PointPhase.OFF
+    val m by vm.map.state.collectAsStateWithLifecycle()
+    val mapping = m.running
+    val context = LocalContext.current
+    val askCamera = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { if (it) vm.startMap() }
 
     // Scan only while this screen is visible, and keep the screen on meanwhile
     // (Android stops delivering unfiltered scan results when the screen is off).
@@ -106,6 +131,7 @@ fun FindScreen(modifier: Modifier, peer: Peer, onBack: () -> Unit) {
         vm.engine.start(peer)
         onDispose {
             vm.stopRecording()
+            vm.map.stop()
             vm.point.stop()
             vm.engine.stop()
             view.keepScreenOn = false
@@ -131,7 +157,11 @@ fun FindScreen(modifier: Modifier, peer: Peer, onBack: () -> Unit) {
 
         Text(phaseLine(s), style = MaterialTheme.typography.bodyMedium, textAlign = TextAlign.Center)
 
-        if (pointing) {
+        if (mapping) {
+            SignalMapView(m, Modifier.fillMaxWidth().weight(1f))
+            Text(mapHeadline(m), fontSize = 32.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
+            Text(mapDetail(m), style = MaterialTheme.typography.bodyMedium, textAlign = TextAlign.Center)
+        } else if (pointing) {
             PointDial(p, Modifier.fillMaxWidth().weight(1f))
             Text(pointHeadline(p), fontSize = 40.sp, fontWeight = FontWeight.Bold)
             Text(pointDetail(p), style = MaterialTheme.typography.bodyMedium, textAlign = TextAlign.Center)
@@ -146,15 +176,24 @@ fun FindScreen(modifier: Modifier, peer: Peer, onBack: () -> Unit) {
             Text(detailLine(s), style = MaterialTheme.typography.bodyMedium)
         }
 
-        if (!p.unsupported) {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            if (pointing || mapping) {
+                OutlinedButton(onClick = vm::hotCold, modifier = Modifier.weight(1f)) { Text("Hot/cold") }
+            }
+            if (!pointing && !p.unsupported) {
+                OutlinedButton(onClick = vm::startPointing, modifier = Modifier.weight(1f)) { Text("Point at it") }
+            }
+            if (p.phase == PointPhase.DONE) {
+                OutlinedButton(onClick = vm.point::restartSweep, modifier = Modifier.weight(1f)) { Text("Sweep again") }
+            }
+            if (!mapping && vm.map.available) {
                 OutlinedButton(
-                    onClick = { if (pointing) vm.point.stop() else vm.point.start() },
+                    onClick = {
+                        if (ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) vm.startMap()
+                        else askCamera.launch(Manifest.permission.CAMERA)
+                    },
                     modifier = Modifier.weight(1f),
-                ) { Text(if (pointing) "Hot/cold" else "Point at it") }
-                if (p.phase == PointPhase.DONE) {
-                    OutlinedButton(onClick = vm.point::restartSweep, modifier = Modifier.weight(1f)) { Text("Sweep again") }
-                }
+                ) { Text("Map") }
             }
         }
 
