@@ -255,6 +255,7 @@ private fun TrackMode() {
             buildString {
                 appendLine(s.status)
                 appendLine("path %.2f m · %.0f poses/s · latency %.0f ms".format(s.pathLengthM, s.rate, s.latencyMs))
+                appendLine("pairs ${s.pairs}, dropped ${s.dropped} · push %.1f ms".format(s.pushMs))
                 last?.let { append("at (%+.2f, %+.2f) m, height %+.2f m".format(it.x, it.y, it.z)) }
             },
             fontFamily = FontFamily.Monospace,

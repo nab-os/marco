@@ -38,6 +38,11 @@ data class TrackState(
     val rate: Float = 0f,
     /** How long after its frame's moment a pose arrives, ms. */
     val latencyMs: Float = 0f,
+    /** Stereo pairs the camera delivered, and how many were dropped because the last was still being pushed. */
+    val pairs: Int = 0,
+    val dropped: Int = 0,
+    /** Mean time to bin and push a pair, ms. */
+    val pushMs: Float = 0f,
     val error: String? = null,
 )
 
@@ -47,19 +52,31 @@ data class TrackState(
  * accelerometer, using the stereo calibration the [Calibrator] saved.
  *
  * Frames are binned and pushed on one worker thread; if it falls behind, pairs
- * are dropped rather than queued, so tracking stays current.
+ * are dropped rather than queued, so tracking stays current. IMU readings go
+ * on another: Basalt's pushes block while it is behind, and one waiting on the
+ * other would stall both.
  */
 class Tracking(private val context: Context) {
 
     private val rig = CameraRig(context)
     private val sensors = context.getSystemService(SensorManager::class.java)
     private val worker = Executors.newSingleThreadExecutor()
+    private val imuWorker = Executors.newSingleThreadExecutor()
     private val busy = AtomicBoolean(false)
+    private val pairs = java.util.concurrent.atomic.AtomicInteger()
+    private val dropped = java.util.concurrent.atomic.AtomicInteger()
+    private val pushNs = java.util.concurrent.atomic.AtomicLong()
+    private val pushed = java.util.concurrent.atomic.AtomicInteger()
     @Volatile private var handle = 0L
     private var sensorThread: HandlerThread? = null
     private var pollJob: Job? = null
     private val frameInfo = ConcurrentHashMap<Long, FrameInfo>()
-    private val waiting = arrayOfNulls<LumaFrame>(2)
+    /**
+     * Recent frames of each lens waiting for their partner, by timestamp (camera thread only).
+     * The lenses' frames don't always arrive alternately, so keeping only the latest of
+     * each lost about half the pairs.
+     */
+    private val waiting = listOf(HashMap<Long, LumaFrame>(), HashMap<Long, LumaFrame>())
 
     /** Camera axis (z) in the IMU frame, from the calibration: for the heading arrow. */
     private var cameraAxis = floatArrayOf(0f, 0f, 1f)
@@ -117,26 +134,40 @@ class Tracking(private val context: Context) {
         sensorThread = null
         val h = handle
         handle = 0
-        // After the camera and sensors: nothing pushes any more when it's freed.
-        worker.execute { if (h != 0L) Vernier.trackerFree(h) }
+        // After the camera and sensors, and the IMU readings already handed over:
+        // nothing pushes any more when it's freed.
+        worker.execute {
+            if (h == 0L) return@execute
+            imuWorker.submit {}.get()
+            Vernier.trackerFree(h)
+        }
         _state.update { it.copy(running = false, status = "Stopped") }
     }
 
     /** Releases the worker for good. */
     fun close() {
         stop()
+        worker.execute { imuWorker.shutdown() }
         worker.shutdown()
     }
 
     /** On the camera thread: pairs the lenses' frames from one capture and hands them on. */
     private fun onFrame(lens: Int, frame: LumaFrame) {
-        waiting[lens] = frame
-        val a = waiting[0]
-        val b = waiting[1]
-        if (a == null || b == null || a.timestampNs != b.timestampNs) return
-        waiting.fill(null)
-        if (!busy.compareAndSet(false, true)) return // still on the last pair: drop this one
+        val partner = waiting[1 - lens].remove(frame.timestampNs)
+        if (partner == null) {
+            waiting[lens][frame.timestampNs] = frame
+            // Forget frames whose partner never came (a dropped buffer).
+            waiting[lens].keys.removeAll { it < frame.timestampNs - MAX_PAIR_WAIT_NS }
+            return
+        }
+        val (a, b) = if (lens == 0) frame to partner else partner to frame
+        pairs.incrementAndGet()
+        if (!busy.compareAndSet(false, true)) { // still on the last pair: drop this one
+            dropped.incrementAndGet()
+            return
+        }
         worker.execute {
+            val started = System.nanoTime()
             try {
                 val h = handle
                 if (h == 0L) return@execute
@@ -148,6 +179,8 @@ class Tracking(private val context: Context) {
                 val binned0 = Vernier.binLuma(a.luma, a.width, a.height, BIN) ?: return@execute
                 val binned1 = Vernier.binLuma(b.luma, b.width, b.height, BIN) ?: return@execute
                 Vernier.trackerPushFrames(h, moment, binned0, a.width / BIN, a.height / BIN, binned1, b.width / BIN, b.height / BIN)
+                pushNs.addAndGet(System.nanoTime() - started)
+                pushed.incrementAndGet()
             } finally {
                 busy.set(false)
             }
@@ -170,7 +203,7 @@ class Tracking(private val context: Context) {
                 imuTimes = LongArray(IMU_BATCH)
                 imuValues = FloatArray(IMU_BATCH * 6)
                 imuCount = 0
-                worker.execute { handle.takeIf { it != 0L }?.let { Vernier.trackerPushImu(it, times, values, IMU_BATCH) } }
+                imuWorker.execute { handle.takeIf { it != 0L }?.let { Vernier.trackerPushImu(it, times, values, IMU_BATCH) } }
             }
         }
 
@@ -183,11 +216,22 @@ class Tracking(private val context: Context) {
             delay(POLL_MS)
             val h = handle.takeIf { it != 0L } ?: continue
             val values = Vernier.trackerPoll(h)
-            if (values.isEmpty()) continue
             val now = SystemClock.elapsedRealtimeNanos()
             val points = (0 until values.size / 8).map { i -> point(values, i * 8) }
             repeat(points.size) { arrivals.addLast(now) }
             while (arrivals.isNotEmpty() && arrivals.first() < now - 1_000_000_000) arrivals.removeFirst()
+            val stats = { s: TrackState ->
+                s.copy(
+                    rate = arrivals.size.toFloat(),
+                    pairs = pairs.get(),
+                    dropped = dropped.get(),
+                    pushMs = pushNs.get() / 1e6f / maxOf(1, pushed.get()),
+                )
+            }
+            if (points.isEmpty()) {
+                _state.update(stats)
+                continue
+            }
             _state.update { s ->
                 val path = s.path + points
                 val added = (maxOf(1, s.path.size) until path.size).sumOf { i ->
@@ -195,11 +239,10 @@ class Tracking(private val context: Context) {
                     val q = path[i - 1]
                     sqrt((p.x - q.x) * (p.x - q.x) + (p.y - q.y) * (p.y - q.y) + (p.z - q.z) * (p.z - q.z)).toDouble()
                 }
-                s.copy(
+                stats(s).copy(
                     status = "Tracking",
                     path = path,
                     pathLengthM = s.pathLengthM + added.toFloat(),
-                    rate = arrivals.size.toFloat(),
                     latencyMs = (now - points.last().tNs) / 1e6f,
                 )
             }
@@ -218,8 +261,10 @@ class Tracking(private val context: Context) {
 
     companion object {
         private const val BIN = 2
-        private const val IMU_BATCH = 20
+        /** 20 ms of readings: Basalt waits for those past a frame before releasing its pose. */
+        private const val IMU_BATCH = 4
         private const val POLL_MS = 50L
+        private const val MAX_PAIR_WAIT_NS = 200_000_000L
 
         /** The camera's z axis in IMU axes: the inverse of the calibrated gyro-to-camera rotation applied to z. */
         private fun cameraAxisInImu(calibration: JSONObject): FloatArray {

@@ -7,8 +7,11 @@
 //! (lens models, the measured gyro-to-camera rotation, the stereo pose), and
 //! frames are moved onto the gyro's clock by the measured offset.
 
+use std::collections::VecDeque;
 use std::ffi::{CString, c_char, c_void};
 use std::path::Path;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use libloading::Library;
 use nalgebra::{Quaternion, UnitQuaternion, Vector3};
@@ -28,6 +31,7 @@ struct VitConfig {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct VitImuSample {
     timestamp: i64,
     ax: f32,
@@ -120,20 +124,36 @@ impl Api {
     }
 }
 
-/// One run of the tracker. Frames and IMU samples may come from different
-/// threads but each call must be serialised (the JNI layer holds a lock).
+/// How far past the newest frame IMU readings are passed on. Basalt's IMU queue
+/// holds 300 readings (1.5 s at 200 Hz) and only drains as frames are processed:
+/// pushing further ahead blocks once frames stop or are slow to start.
+const IMU_LEAD_NS: i64 = 100_000_000;
+/// Readings kept back at most (2 s): older ones are dropped while no frames come.
+const IMU_PENDING_MAX: usize = 400;
+
+/// One run of the tracker. IMU readings, frames and polling may come from
+/// different threads at once: pushes are serialised here, and polling reads
+/// Basalt's concurrent output queue without waiting on them (pushes block
+/// while Basalt is behind).
 pub struct Tracker {
     api: Api,
     tracker: *mut c_void,
     /// Added to camera timestamps: the measured gyro-minus-camera clock offset.
     offset_ns: i64,
-    /// Last frame pushed, to keep frame timestamps strictly increasing.
-    last_frame_ns: i64,
-    stopped: bool,
+    inputs: Mutex<Inputs>,
+    stopped: AtomicBool,
 }
 
-// The tracker pointer is only used under the JNI layer's lock.
+struct Inputs {
+    /// Last frame pushed, to keep frame timestamps strictly increasing.
+    last_frame_ns: i64,
+    /// IMU readings held back until a frame comes near them.
+    pending: VecDeque<VitImuSample>,
+}
+
+// Basalt's VIT calls are safe from several threads; the pushes are serialised by `inputs`.
 unsafe impl Send for Tracker {}
+unsafe impl Sync for Tracker {}
 
 impl Tracker {
     /// Writes Basalt's calibration and settings into `dir` and starts it, from a
@@ -165,25 +185,49 @@ impl Tracker {
             unsafe { (api.destroy)(tracker) };
             return Err("vit_tracker_start failed".into());
         }
-        Ok(Self { api, tracker, offset_ns, last_frame_ns: i64::MIN, stopped: false })
+        Ok(Self {
+            api,
+            tracker,
+            offset_ns,
+            inputs: Mutex::new(Inputs { last_frame_ns: i64::MIN, pending: VecDeque::new() }),
+            stopped: AtomicBool::new(false),
+        })
     }
 
     /// One IMU reading on the sensors' clock: accelerometer m/s², gyroscope rad/s.
-    pub fn push_imu(&mut self, t_ns: i64, accel: [f32; 3], gyro: [f32; 3]) {
-        if self.stopped {
+    pub fn push_imu(&self, t_ns: i64, accel: [f32; 3], gyro: [f32; 3]) {
+        if self.stopped.load(Ordering::Acquire) {
             return;
         }
-        let sample = VitImuSample { timestamp: t_ns, ax: accel[0], ay: accel[1], az: accel[2], wx: gyro[0], wy: gyro[1], wz: gyro[2] };
-        unsafe { (self.api.push_imu)(self.tracker, &sample) };
+        let mut inputs = self.inputs.lock().unwrap_or_else(|e| e.into_inner());
+        if inputs.pending.len() == IMU_PENDING_MAX {
+            inputs.pending.pop_front();
+        }
+        inputs.pending.push_back(VitImuSample { timestamp: t_ns, ax: accel[0], ay: accel[1], az: accel[2], wx: gyro[0], wy: gyro[1], wz: gyro[2] });
+        self.flush_imu(&mut inputs);
+    }
+
+    /// Passes on the readings up to [IMU_LEAD_NS] past the newest frame.
+    fn flush_imu(&self, inputs: &mut Inputs) {
+        let until = inputs.last_frame_ns.saturating_add(IMU_LEAD_NS);
+        while let Some(sample) = inputs.pending.front().filter(|s| s.timestamp <= until) {
+            unsafe { (self.api.push_imu)(self.tracker, sample) };
+            inputs.pending.pop_front();
+        }
     }
 
     /// A stereo pair from one capture: `t_ns` is the camera's moment for both
     /// (mid-exposure of the middle row), on the camera clock. Returns false if
     /// the pair was dropped (out of order).
-    pub fn push_frames(&mut self, t_ns: i64, cam0: (&[u8], u32, u32), cam1: (&[u8], u32, u32)) -> bool {
+    pub fn push_frames(&self, t_ns: i64, cam0: (&[u8], u32, u32), cam1: (&[u8], u32, u32)) -> bool {
         let t = t_ns + self.offset_ns;
-        if self.stopped || t <= self.last_frame_ns {
+        let mut inputs = self.inputs.lock().unwrap_or_else(|e| e.into_inner());
+        if self.stopped.load(Ordering::Acquire) || t <= inputs.last_frame_ns {
             return false;
+        }
+        if inputs.last_frame_ns == i64::MIN {
+            // The first frame: readings from long before it are no use.
+            inputs.pending.retain(|s| s.timestamp >= t - IMU_LEAD_NS);
         }
         for (index, (luma, width, height)) in [cam0, cam1].into_iter().enumerate() {
             if luma.len() < (width * height) as usize {
@@ -204,14 +248,15 @@ impl Tracker {
             // Basalt copies the image before returning.
             unsafe { (self.api.push_img)(self.tracker, &sample) };
         }
-        self.last_frame_ns = t;
+        inputs.last_frame_ns = t;
+        self.flush_imu(&mut inputs);
         true
     }
 
     /// Poses produced since the last call, oldest first.
-    pub fn poll(&mut self) -> Vec<Pose> {
+    pub fn poll(&self) -> Vec<Pose> {
         let mut poses = Vec::new();
-        if self.stopped {
+        if self.stopped.load(Ordering::Acquire) {
             return poses;
         }
         loop {
@@ -230,9 +275,8 @@ impl Tracker {
 
     /// Stops the pipeline. Poses can't be polled afterwards: Basalt then queues
     /// an empty end-of-stream state that its pop function dereferences.
-    pub fn stop(&mut self) {
-        if !self.stopped {
-            self.stopped = true;
+    pub fn stop(&self) {
+        if !self.stopped.swap(true, Ordering::AcqRel) {
             unsafe { (self.api.stop)(self.tracker) };
         }
     }
@@ -400,7 +444,7 @@ mod tests {
 
         let calibration = std::fs::read_to_string(dir.join("calibration.json")).unwrap();
         let work = std::env::temp_dir().join("marco-tracker-test");
-        let mut tracker = Tracker::start(&calibration, &work).expect("starts");
+        let tracker = Tracker::start(&calibration, &work).expect("starts");
         let started = std::time::Instant::now();
         let mut poses = Vec::new();
         let mut next_imu = 0;
