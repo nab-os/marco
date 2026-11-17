@@ -119,7 +119,9 @@ int main(int argc, char **argv) {
   size_t next_imu = 0;
   for (size_t f = 0; f < cams[0].size(); f++) {
     const int64_t t = cams[0][f].t;
-    for (; next_imu < imu.size() && imu[next_imu].t <= t; next_imu++) {
+    // Basalt integrates IMU up to the first sample after a frame, and in deterministic mode waits
+    // for each frame to come out: give it the samples just past the frame first.
+    for (; next_imu < imu.size() && imu[next_imu].t <= t + 20000000; next_imu++) {
       const Imu &s = imu[next_imu];
       vit_imu_sample_t sample{s.t, s.a[0], s.a[1], s.a[2], s.w[0], s.w[1], s.w[2]};
       vit_tracker_push_imu_sample(tracker, &sample);

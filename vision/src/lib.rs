@@ -58,6 +58,26 @@ pub fn target() -> Target {
     Target::new(1.0, CODE_SIZE).with_packing(CodePacking::TwoBits)
 }
 
+/// `luma` (`width × height`, rows packed) averaged over `bin × bin` blocks, in
+/// encoded values: a recording's frames, cheaply, at the calibrated geometry.
+pub fn bin_luma(luma: &[u8], width: usize, height: usize, bin: usize) -> Vec<u8> {
+    let bin = bin.max(1);
+    let (out_width, out_height) = (width / bin, height / bin);
+    let mut sums = vec![0u32; out_width];
+    let mut out = Vec::with_capacity(out_width * out_height);
+    let area = (bin * bin) as u32;
+    for y in 0..out_height {
+        sums.fill(0);
+        for row in luma[y * bin * width..].chunks(width).take(bin) {
+            for (x, sum) in sums.iter_mut().enumerate() {
+                *sum += row[x * bin..x * bin + bin].iter().map(|&v| v as u32).sum::<u32>();
+            }
+        }
+        out.extend(sums.iter().map(|&sum| (sum / area) as u8));
+    }
+    out
+}
+
 /// The board as a `width × height` 8-bit sRGB grey image with squares of
 /// `square_px` pixels, its origin at the top-left corner. Screens decode sRGB,
 /// so the anti-aliased edges come out at the light Vernier rendered.
@@ -800,6 +820,28 @@ pub extern "system" fn Java_dev_nabos_marco_vision_Vernier_stereo(
     env.new_string(json).map_or(std::ptr::null_mut(), |string| string.into_raw())
 }
 
+/// [`bin_luma`], or null on a buffer too short for its size.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_nabos_marco_vision_Vernier_binLuma(
+    env: JNIEnv,
+    _class: JClass,
+    luma: JByteArray,
+    width: jint,
+    height: jint,
+    bin: jint,
+) -> jbyteArray {
+    let (width, height) = (width.max(0) as usize, height.max(0) as usize);
+    let Ok(bytes) = env.convert_byte_array(&luma) else {
+        return std::ptr::null_mut();
+    };
+    if bytes.len() < width * height {
+        return std::ptr::null_mut();
+    }
+    let binned = guarded(Vec::new(), || bin_luma(&bytes, width, height, bin.max(1) as usize));
+    env.byte_array_from_slice(&binned)
+        .map_or(std::ptr::null_mut(), |array| array.into_raw())
+}
+
 fn error_json(message: &str) -> String {
     serde_json::json!({ "error": message }).to_string()
 }
@@ -1075,5 +1117,13 @@ mod tests {
         let offset = (Vector3::from(found.translation_squares) - truth_translation).norm();
         assert!(offset < 0.1, "translation off by {offset} squares: {:?}", found.translation_squares);
         assert!(found.pairs >= 6, "{} pairs", found.pairs);
+    }
+
+    #[test]
+    fn bins_luma() {
+        // 4×2 → 2×1: each output the mean of a 2×2 block.
+        let luma = [0, 10, 100, 200, 20, 30, 50, 250];
+        assert_eq!(bin_luma(&luma, 4, 2, 2), vec![15, 150]);
+        assert_eq!(bin_luma(&luma, 4, 2, 1), luma.to_vec());
     }
 }

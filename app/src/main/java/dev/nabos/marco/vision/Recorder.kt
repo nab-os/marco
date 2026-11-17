@@ -30,11 +30,16 @@ import java.io.PrintWriter
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 data class RecorderStats(
     val recording: Boolean = false,
     val frames: Int = 0,
+    /** Captures dropped because writing fell behind. */
+    val dropped: Int = 0,
     val imu: Int = 0,
     val rssi: Int = 0,
     val dir: File? = null,
@@ -67,6 +72,13 @@ class Recorder(private val context: Context) {
     private val framesCsv = arrayOfNulls<PrintWriter>(2)
     private val captureCsv = arrayOfNulls<PrintWriter>(2)
     private val lensFrames = listOf(AtomicInteger(), AtomicInteger())
+    /**
+     * Bins and writes frames off the camera thread: binning a 1280×960 frame in Kotlin took
+     * ~300 ms in a debug build, and on the camera thread that dropped 9 frames in 10.
+     */
+    private var writer: ExecutorService? = null
+    private val pending = AtomicInteger()
+    private val dropped = AtomicInteger()
     private var imuCsv: PrintWriter? = null
     private var rssiCsv: PrintWriter? = null
     private val frames = AtomicInteger()
@@ -84,14 +96,14 @@ class Recorder(private val context: Context) {
         val size = Size(capture.width / bin, capture.height / bin)
         val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
         val dir = File(context.getExternalFilesDir("recordings"), stamp).apply { mkdirs() }
-        frames.set(0); imu.set(0); rssi.set(0)
+        frames.set(0); imu.set(0); rssi.set(0); dropped.set(0); pending.set(0)
         lensFrames.forEach { it.set(0) }
+        val frameWriter = Executors.newSingleThreadExecutor().also { writer = it }
 
         File(dir, "meta.json").writeText(meta(size, capture, bin, captures.getOrNull(1)).toString(2))
         // The calibration for exactly these frames, if this phone has one: a recording then stands alone.
         File(context.filesDir, "vision/camera-${rig.label.replace('/', '-')}-${size.width}x${size.height}.json")
             .takeIf { it.exists() }?.copyTo(File(dir, "calibration.json"), overwrite = true)
-        val binned = captures.map { ByteArray(it.width / bin * (it.height / bin)) }
         captures.indices.forEach { lens ->
             val suffix = if (lens == 0) "" else "$lens"
             frameOut[lens] = BufferedOutputStream(FileOutputStream(File(dir, "frames$suffix.y8")), 1 shl 20)
@@ -104,10 +116,21 @@ class Recorder(private val context: Context) {
         rig.startLenses(
             captures,
             onFrame = { lens, f ->
-                binDown(f, bin, binned[lens])
-                frameOut[lens]?.write(binned[lens])
-                framesCsv[lens]?.println("${lensFrames[lens].getAndIncrement()},${f.timestampNs}")
-                if (lens == 0) frames.incrementAndGet()
+                // When writing falls behind, drop rather than stall the camera (the converter keeps only pairs both lenses wrote).
+                if (pending.get() >= MAX_PENDING) {
+                    if (lens == 0) dropped.incrementAndGet()
+                    return@startLenses
+                }
+                pending.incrementAndGet()
+                frameWriter.execute {
+                    val binned = if (Vernier.available) Vernier.binLuma(f.luma, f.width, f.height, bin) else binDown(f, bin)
+                    if (binned != null) {
+                        frameOut[lens]?.write(binned)
+                        framesCsv[lens]?.println("${lensFrames[lens].getAndIncrement()},${f.timestampNs}")
+                        if (lens == 0) frames.incrementAndGet()
+                    }
+                    pending.decrementAndGet()
+                }
             },
             onInfo = { lens, i ->
                 captureCsv[lens]?.println("${i.timestampNs},${i.exposureNs ?: ""},${i.rollingShutterSkewNs ?: ""},${i.frameDurationNs ?: ""},${i.focusDiopters ?: ""}")
@@ -132,7 +155,7 @@ class Recorder(private val context: Context) {
         }
         jobs += scope.launch {
             while (true) {
-                _stats.update { it.copy(frames = frames.get(), imu = imu.get(), rssi = rssi.get()) }
+                _stats.update { it.copy(frames = frames.get(), dropped = dropped.get(), imu = imu.get(), rssi = rssi.get()) }
                 delay(500)
             }
         }
@@ -142,15 +165,17 @@ class Recorder(private val context: Context) {
     fun stop() {
         if (!_stats.value.recording) return
         rig.stop()
+        writer?.let { it.shutdown(); it.awaitTermination(5, TimeUnit.SECONDS) }
+        writer = null
         sensors.unregisterListener(imuListener)
         sensorThread?.let { it.quitSafely(); it.join(1_000) }
         sensorThread = null
         jobs.forEach { it.cancel() }
         jobs.clear()
-        // Both threads have finished: nothing writes to these any more.
+        // The camera, writer and sensor threads have finished: nothing writes to these any more.
         (frameOut.toList() + framesCsv + captureCsv + listOf(imuCsv, rssiCsv)).forEach { runCatching { it?.close() } }
         frameOut.fill(null); framesCsv.fill(null); captureCsv.fill(null); imuCsv = null; rssiCsv = null
-        _stats.update { it.copy(recording = false, frames = frames.get(), imu = imu.get(), rssi = rssi.get()) }
+        _stats.update { it.copy(recording = false, frames = frames.get(), dropped = dropped.get(), imu = imu.get(), rssi = rssi.get()) }
     }
 
     private val imuListener = object : SensorEventListener {
@@ -163,10 +188,11 @@ class Recorder(private val context: Context) {
         override fun onAccuracyChanged(sensor: Sensor, accuracy: Int) = Unit
     }
 
-    /** Averages [bin]×[bin] blocks of [frame] into [out], which holds the smaller frame. */
-    private fun binDown(frame: LumaFrame, bin: Int, out: ByteArray) {
+    /** Averages [bin]×[bin] blocks of [frame]: the fallback for builds without Vernier. */
+    private fun binDown(frame: LumaFrame, bin: Int): ByteArray {
         val width = frame.width / bin
         val height = frame.height / bin
+        val out = ByteArray(width * height)
         for (y in 0 until height) {
             for (x in 0 until width) {
                 var sum = 0
@@ -177,6 +203,7 @@ class Recorder(private val context: Context) {
                 out[y * width + x] = (sum / (bin * bin)).toByte()
             }
         }
+        return out
     }
 
     private fun writer(dir: File, name: String, header: String) =
@@ -230,5 +257,10 @@ class Recorder(private val context: Context) {
             })
             .put("display", JSONObject().put("width_px", display.widthPixels).put("height_px", display.heightPixels)
                 .put("xdpi", display.xdpi.toDouble()).put("ydpi", display.ydpi.toDouble()))
+    }
+
+    private companion object {
+        /** Frames waiting for the writer before captures get dropped: about a third of a second. */
+        const val MAX_PENDING = 20
     }
 }

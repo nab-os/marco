@@ -275,7 +275,7 @@ private fun RecordMode() {
             { if (s.recording) recorder.stop() else recorder.start(scope) },
             Modifier.fillMaxWidth(),
         ) { Text(if (s.recording) "Stop" else "Record") }
-        Text("Frames ${s.frames} · motion ${s.imu}")
+        Text("Frames ${s.frames}${if (s.dropped > 0) " (${s.dropped} dropped)" else ""} · motion ${s.imu}")
         s.dir?.let { Text("→ ${it.path.substringAfter("/files/")}", style = MaterialTheme.typography.bodySmall) }
         s.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
     }

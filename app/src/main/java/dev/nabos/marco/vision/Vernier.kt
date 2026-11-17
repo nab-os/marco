@@ -58,4 +58,7 @@ object Vernier {
      * translation_squares, pairs, rotation_sd_deg, translation_sd_squares}` or `{error}`.
      */
     @JvmStatic external fun stereo(first: Long, second: Long): String
+
+    /** [luma] (`width × height`, rows packed) averaged over [bin]×[bin] blocks; null on a short buffer. */
+    @JvmStatic external fun binLuma(luma: ByteArray, width: Int, height: Int, bin: Int): ByteArray?
 }
