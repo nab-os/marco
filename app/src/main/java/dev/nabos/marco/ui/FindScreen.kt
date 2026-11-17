@@ -1,6 +1,12 @@
 package dev.nabos.marco.ui
 
+import android.Manifest
 import android.app.Application
+import android.content.Context
+import android.content.pm.ApplicationInfo
+import android.content.pm.PackageManager
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
@@ -36,7 +42,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.lerp
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
+import androidx.core.content.ContextCompat
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -51,12 +59,29 @@ import dev.nabos.marco.finder.FinderState
 import dev.nabos.marco.finder.LinkPhase
 import dev.nabos.marco.finder.PointAtIt
 import dev.nabos.marco.finder.PointPhase
+import dev.nabos.marco.vision.Recorder
 import kotlin.math.roundToInt
 
 class FinderViewModel(app: Application) : AndroidViewModel(app) {
     val engine = FinderEngine(app, viewModelScope)
     val point = PointAtIt(app, viewModelScope, engine)
+    private val recorderLazy = lazy { Recorder(app) }
+    /** Debug builds only: records camera, motion and RSSI for tuning the signal map. */
+    val recorder by recorderLazy
+
+    fun startRecording() {
+        engine.fastPoll = true
+        recorder.start(viewModelScope, engine.samples)
+    }
+
+    fun stopRecording() {
+        if (!recorderLazy.isInitialized()) return
+        recorder.stop()
+        engine.fastPoll = point.state.value.phase != PointPhase.OFF
+    }
+
     override fun onCleared() {
+        stopRecording()
         point.stop()
         engine.stop()
     }
@@ -80,6 +105,7 @@ fun FindScreen(modifier: Modifier, peer: Peer, onBack: () -> Unit) {
         view.keepScreenOn = true
         vm.engine.start(peer)
         onDispose {
+            vm.stopRecording()
             vm.point.stop()
             vm.engine.stop()
             view.keepScreenOn = false
@@ -99,7 +125,8 @@ fun FindScreen(modifier: Modifier, peer: Peer, onBack: () -> Unit) {
                 fontWeight = FontWeight.SemiBold,
                 textAlign = TextAlign.Center,
             )
-            Spacer(Modifier.width(72.dp)) // balances the Back button so the title is centred
+            // Same width as the Back button, so the title stays centred.
+            if (debuggable()) RecordToggle(vm, Modifier.width(72.dp)) else Spacer(Modifier.width(72.dp))
         }
 
         Text(phaseLine(s), style = MaterialTheme.typography.bodyMedium, textAlign = TextAlign.Center)
@@ -159,6 +186,31 @@ fun FindScreen(modifier: Modifier, peer: Peer, onBack: () -> Unit) {
             s.autoRing,
             vm.engine::setAutoRing,
         )
+    }
+}
+
+private fun debuggable(context: Context) = (context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
+
+@Composable
+private fun debuggable() = debuggable(LocalContext.current)
+
+/** Debug: record camera + motion + RSSI while finding, for tuning the signal map offline. */
+@Composable
+private fun RecordToggle(vm: FinderViewModel, modifier: Modifier) {
+    val context = LocalContext.current
+    val stats by vm.recorder.stats.collectAsStateWithLifecycle()
+    val askCamera = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { if (it) vm.startRecording() }
+    TextButton(
+        onClick = {
+            when {
+                stats.recording -> vm.stopRecording()
+                ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED -> vm.startRecording()
+                else -> askCamera.launch(Manifest.permission.CAMERA)
+            }
+        },
+        modifier = modifier,
+    ) {
+        Text(if (stats.recording) "■ ${stats.rssi}" else "● Rec", color = if (stats.recording) HOT else Color.Unspecified)
     }
 }
 

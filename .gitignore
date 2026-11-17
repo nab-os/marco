@@ -6,3 +6,5 @@ local.properties
 *.iml
 .DS_Store
 .kotlin/
+vision/target/
+/app/src/main/jniLibs/arm64-v8a/libmarco_vision.so

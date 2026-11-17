@@ -73,3 +73,6 @@ dependencies {
     // QR code generation + scanning for pairing (no Google Play Services needed).
     implementation("com.journeyapps:zxing-android-embedded:4.3.0")
 }
+
+// Optional native Vernier bridge, see vision.gradle.kts.
+apply(from = "vision.gradle.kts")

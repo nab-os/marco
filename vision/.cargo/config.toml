@@ -1,0 +1,3 @@
+[net]
+# Use the system git so the private vernier-rs dependency goes through your SSH agent.
+git-fetch-with-cli = true

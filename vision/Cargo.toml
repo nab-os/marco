@@ -1,0 +1,25 @@
+[package]
+name = "marco-vision"
+version = "0.1.0"
+edition = "2024"
+description = "Marco's bridge to Vernier: the on-screen calibration board, and camera calibration from it."
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+jni = "0.21"
+nalgebra = "0.35"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# vernier-rs is private until its relicensing; fetched over SSH (see .cargo/config.toml).
+vernier-camera = { git = "ssh://git@github.com/nab-os/vernier-rs.git", rev = "c4728f5869a4a8559d94c22c6a17083fc4e112f2" }
+vernier-patterns = { git = "ssh://git@github.com/nab-os/vernier-rs.git", rev = "c4728f5869a4a8559d94c22c6a17083fc4e112f2" }
+vernier-core = { git = "ssh://git@github.com/nab-os/vernier-rs.git", rev = "c4728f5869a4a8559d94c22c6a17083fc4e112f2" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "unwind" # JNI entry points catch panics rather than abort the app
