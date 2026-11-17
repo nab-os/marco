@@ -100,6 +100,13 @@ struct Api {
 }
 
 impl Api {
+    /// Loaded once and never unloaded: Basalt's threads can outlive a tracker
+    /// (they ran on in unmapped code, crashing, when it was unloaded with one).
+    fn get() -> Result<&'static Self, String> {
+        static API: std::sync::OnceLock<Result<Api, String>> = std::sync::OnceLock::new();
+        API.get_or_init(Self::load).as_ref().map_err(Clone::clone)
+    }
+
     fn load() -> Result<Self, String> {
         let library = unsafe { Library::new("libbasalt.so") }.map_err(|e| format!("Basalt isn't in this build: {e}"))?;
         unsafe {
@@ -124,31 +131,50 @@ impl Api {
     }
 }
 
-/// How far past the newest frame IMU readings are passed on. Basalt's IMU queue
+/// How far past the newest frame (pushed or dropped) IMU readings are passed on. Basalt's IMU queue
 /// holds 300 readings (1.5 s at 200 Hz) and only drains as frames are processed:
 /// pushing further ahead blocks once frames stop or are slow to start.
 const IMU_LEAD_NS: i64 = 100_000_000;
 /// Readings kept back at most (2 s): older ones are dropped while no frames come.
 const IMU_PENDING_MAX: usize = 400;
+/// Pairs Basalt may be working on at once (its optical flow and estimator run
+/// side by side). Past that a pair is dropped: Basalt queues 20 otherwise, and
+/// when it is slower than the camera every pose comes ~2 s late.
+const MAX_IN_FLIGHT: usize = 3;
 
 /// One run of the tracker. IMU readings, frames and polling may come from
-/// different threads at once: pushes are serialised here, and polling reads
-/// Basalt's concurrent output queue without waiting on them (pushes block
-/// while Basalt is behind).
+/// different threads at once. Pushes block while Basalt is behind, and it
+/// waits for IMU readings past a frame before taking the next: so IMU readings
+/// still get in while a frame push waits, and polling reads Basalt's
+/// concurrent output queue without waiting on either.
 pub struct Tracker {
-    api: Api,
+    api: &'static Api,
     tracker: *mut c_void,
     /// Added to camera timestamps: the measured gyro-minus-camera clock offset.
     offset_ns: i64,
     inputs: Mutex<Inputs>,
+    /// Held while pushing a pair: Basalt takes each pair's images in a row.
+    frames: Mutex<()>,
+    outputs: Mutex<Outputs>,
     stopped: AtomicBool,
 }
 
 struct Inputs {
     /// Last frame pushed, to keep frame timestamps strictly increasing.
     last_frame_ns: i64,
+    /// Newest frame offered, pushed or dropped: IMU readings go on up to it.
+    seen_frame_ns: i64,
     /// IMU readings held back until a frame comes near them.
     pending: VecDeque<VitImuSample>,
+    /// Pushed frames Basalt hasn't given a pose for yet.
+    in_flight: VecDeque<i64>,
+}
+
+struct Outputs {
+    /// Poses taken from Basalt, not polled yet.
+    ready: Vec<Pose>,
+    /// Newest pose's time: frames up to it are done (Basalt may skip one).
+    newest_ns: i64,
 }
 
 // Basalt's VIT calls are safe from several threads; the pushes are serialised by `inputs`.
@@ -173,7 +199,7 @@ impl Tracker {
         );
         write("basalt.toml", &toml)?;
 
-        let api = Api::load()?;
+        let api = Api::get()?;
         let file = CString::new(dir.join("basalt.toml").to_string_lossy().as_bytes()).map_err(|e| e.to_string())?;
         let config = VitConfig { file: file.as_ptr(), cam_count: 2, imu_count: 1, show_ui: false };
         let mut tracker = std::ptr::null_mut();
@@ -189,7 +215,9 @@ impl Tracker {
             api,
             tracker,
             offset_ns,
-            inputs: Mutex::new(Inputs { last_frame_ns: i64::MIN, pending: VecDeque::new() }),
+            inputs: Mutex::new(Inputs { last_frame_ns: i64::MIN, seen_frame_ns: i64::MIN, pending: VecDeque::new(), in_flight: VecDeque::new() }),
+            frames: Mutex::new(()),
+            outputs: Mutex::new(Outputs { ready: Vec::new(), newest_ns: i64::MIN }),
             stopped: AtomicBool::new(false),
         })
     }
@@ -209,7 +237,7 @@ impl Tracker {
 
     /// Passes on the readings up to [IMU_LEAD_NS] past the newest frame.
     fn flush_imu(&self, inputs: &mut Inputs) {
-        let until = inputs.last_frame_ns.saturating_add(IMU_LEAD_NS);
+        let until = inputs.seen_frame_ns.saturating_add(IMU_LEAD_NS);
         while let Some(sample) = inputs.pending.front().filter(|s| s.timestamp <= until) {
             unsafe { (self.api.push_imu)(self.tracker, sample) };
             inputs.pending.pop_front();
@@ -218,21 +246,35 @@ impl Tracker {
 
     /// A stereo pair from one capture: `t_ns` is the camera's moment for both
     /// (mid-exposure of the middle row), on the camera clock. Returns false if
-    /// the pair was dropped (out of order).
+    /// the pair was dropped: out of order, or Basalt still busy with earlier ones.
     pub fn push_frames(&self, t_ns: i64, cam0: (&[u8], u32, u32), cam1: (&[u8], u32, u32)) -> bool {
         let t = t_ns + self.offset_ns;
-        let mut inputs = self.inputs.lock().unwrap_or_else(|e| e.into_inner());
-        if self.stopped.load(Ordering::Acquire) || t <= inputs.last_frame_ns {
+        if [cam0, cam1].iter().any(|(luma, width, height)| luma.len() < (width * height) as usize) {
             return false;
         }
-        if inputs.last_frame_ns == i64::MIN {
-            // The first frame: readings from long before it are no use.
-            inputs.pending.retain(|s| s.timestamp >= t - IMU_LEAD_NS);
-        }
-        for (index, (luma, width, height)) in [cam0, cam1].into_iter().enumerate() {
-            if luma.len() < (width * height) as usize {
+        let _frames = self.frames.lock().unwrap_or_else(|e| e.into_inner());
+        {
+            let mut inputs = self.inputs.lock().unwrap_or_else(|e| e.into_inner());
+            if self.stopped.load(Ordering::Acquire) || t <= inputs.last_frame_ns {
                 return false;
             }
+            if inputs.seen_frame_ns == i64::MIN {
+                // The first frame: readings from long before it are no use.
+                inputs.pending.retain(|s| s.timestamp >= t - IMU_LEAD_NS);
+            }
+            inputs.seen_frame_ns = inputs.seen_frame_ns.max(t);
+            self.flush_imu(&mut inputs);
+            let done = self.take_poses();
+            inputs.in_flight.retain(|&f| f > done);
+            if inputs.in_flight.len() >= MAX_IN_FLIGHT {
+                return false;
+            }
+            inputs.last_frame_ns = t;
+            inputs.in_flight.push_back(t);
+        }
+        // Without holding `inputs`: this blocks while Basalt's image queue is full,
+        // and Basalt only takes the next image once it has the IMU readings past it.
+        for (index, (luma, width, height)) in [cam0, cam1].into_iter().enumerate() {
             let sample = VitImgSample {
                 cam_index: index as u32,
                 timestamp: t,
@@ -248,16 +290,20 @@ impl Tracker {
             // Basalt copies the image before returning.
             unsafe { (self.api.push_img)(self.tracker, &sample) };
         }
-        inputs.last_frame_ns = t;
-        self.flush_imu(&mut inputs);
         true
     }
 
     /// Poses produced since the last call, oldest first.
     pub fn poll(&self) -> Vec<Pose> {
-        let mut poses = Vec::new();
+        self.take_poses();
+        std::mem::take(&mut self.outputs.lock().unwrap_or_else(|e| e.into_inner()).ready)
+    }
+
+    /// Moves Basalt's new poses into `outputs`; the newest pose's time.
+    fn take_poses(&self) -> i64 {
+        let mut outputs = self.outputs.lock().unwrap_or_else(|e| e.into_inner());
         if self.stopped.load(Ordering::Acquire) {
-            return poses;
+            return outputs.newest_ns;
         }
         loop {
             let mut pose = std::ptr::null_mut();
@@ -266,11 +312,12 @@ impl Tracker {
             }
             let mut data = Pose::default();
             if unsafe { (self.api.pose_data)(pose, &mut data) } == VIT_SUCCESS {
-                poses.push(data);
+                outputs.newest_ns = outputs.newest_ns.max(data.timestamp);
+                outputs.ready.push(data);
             }
             unsafe { (self.api.pose_destroy)(pose) };
         }
-        poses
+        outputs.newest_ns
     }
 
     /// Stops the pipeline. Poses can't be polled afterwards: Basalt then queues
@@ -407,74 +454,175 @@ mod tests {
         assert!(basalt_calibration(&mono).is_err());
     }
 
+    /// A Marco stereo recording, as the tests feed it to Basalt.
+    struct Recording {
+        calibration: String,
+        sizes: [(u32, u32); 2],
+        /// Each lens's frames, one after the other.
+        frames: [Vec<u8>; 2],
+        /// Captures both lenses have: camera timestamp, mid-exposure moment, frame index per lens.
+        captures: Vec<(i64, i64, [usize; 2])>,
+        /// Gyro readings with the latest accelerometer one, as the app pairs them.
+        imu: Vec<(i64, [f32; 3], [f32; 3])>,
+    }
+
+    impl Recording {
+        fn load() -> Self {
+            let dir = std::path::PathBuf::from(std::env::var("MARCO_RECORDING").expect("MARCO_RECORDING"));
+            let csv = |name: &str| -> Vec<Vec<String>> {
+                std::fs::read_to_string(dir.join(name)).unwrap().lines().skip(1)
+                    .map(|l| l.split(',').map(String::from).collect()).collect()
+            };
+            let meta: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("meta.json")).unwrap()).unwrap();
+            let size = |key: &str| (meta[key]["width"].as_u64().unwrap() as u32, meta[key]["height"].as_u64().unwrap() as u32);
+            let index = |name: &str| -> std::collections::HashMap<i64, usize> {
+                csv(name).iter().map(|r| (r[1].parse().unwrap(), r[0].parse().unwrap())).collect()
+            };
+            let (index0, index1) = (index("frames.csv"), index("frames1.csv"));
+            let info: std::collections::HashMap<i64, (i64, i64)> = csv("capture.csv").iter()
+                .map(|r| (r[0].parse().unwrap(), (r[1].parse().unwrap_or(0), r[2].parse().unwrap_or(0)))).collect();
+            let mut captures: Vec<(i64, i64, [usize; 2])> = index0.iter()
+                .filter_map(|(t, i0)| index1.get(t).map(|i1| {
+                    let (exposure, skew) = info.get(t).copied().unwrap_or((0, 0));
+                    (*t, t + exposure / 2 + skew / 2, [*i0, *i1])
+                }))
+                .collect();
+            captures.sort();
+            let mut accel = [0f32; 3];
+            let mut imu = Vec::new();
+            for r in csv("imu.csv") {
+                let v = [r[2].parse().unwrap(), r[3].parse().unwrap(), r[4].parse().unwrap()];
+                if r[1] == "a" { accel = v } else { imu.push((r[0].parse::<i64>().unwrap(), accel, v)) }
+            }
+            Self {
+                calibration: std::fs::read_to_string(dir.join("calibration.json")).unwrap(),
+                sizes: [size("camera"), size("second")],
+                frames: [std::fs::read(dir.join("frames.y8")).unwrap(), std::fs::read(dir.join("frames1.y8")).unwrap()],
+                captures,
+                imu,
+            }
+        }
+
+        fn frame(&self, lens: usize, index: usize) -> (&[u8], u32, u32) {
+            let (w, h) = self.sizes[lens];
+            let n = (w * h) as usize;
+            (&self.frames[lens][index * n..(index + 1) * n], w, h)
+        }
+    }
+
+    fn report(poses: &[Pose], frames: usize, started: std::time::Instant) {
+        let path: f32 = poses.windows(2).map(|w| ((w[1].px - w[0].px).powi(2) + (w[1].py - w[0].py).powi(2) + (w[1].pz - w[0].pz).powi(2)).sqrt()).sum();
+        let (a, b) = (poses.first().unwrap(), poses.last().unwrap());
+        let closing = ((b.px - a.px).powi(2) + (b.py - a.py).powi(2) + (b.pz - a.pz).powi(2)).sqrt();
+        eprintln!("{} poses for {frames} frames in {:.1} s, path {path:.2} m, start to end {closing:.2} m", poses.len(), started.elapsed().as_secs_f64());
+    }
+
     /// Drives the real Basalt through this bridge with a Marco stereo recording,
-    /// as the app does: checks the C structs line up and poses come out.
+    /// every frame: checks the C structs line up and poses come out.
     ///
     ///   MARCO_RECORDING=<recording dir> LD_LIBRARY_PATH=<dir with libbasalt.so> \
     ///     cargo test --release tracks_a_recording -- --ignored --nocapture
     #[test]
     #[ignore]
     fn tracks_a_recording() {
-        let dir = std::path::PathBuf::from(std::env::var("MARCO_RECORDING").expect("MARCO_RECORDING"));
-        let csv = |name: &str| -> Vec<Vec<String>> {
-            std::fs::read_to_string(dir.join(name)).unwrap().lines().skip(1)
-                .map(|l| l.split(',').map(String::from).collect()).collect()
-        };
-        let meta: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("meta.json")).unwrap()).unwrap();
-        let sizes = [
-            (meta["camera"]["width"].as_u64().unwrap() as u32, meta["camera"]["height"].as_u64().unwrap() as u32),
-            (meta["second"]["width"].as_u64().unwrap() as u32, meta["second"]["height"].as_u64().unwrap() as u32),
-        ];
-        let frames: Vec<Vec<u8>> = ["frames.y8", "frames1.y8"].iter().map(|f| std::fs::read(dir.join(f)).unwrap()).collect();
-        let index = |name: &str| -> std::collections::HashMap<i64, usize> {
-            csv(name).iter().map(|r| (r[1].parse().unwrap(), r[0].parse().unwrap())).collect()
-        };
-        let (index0, index1) = (index("frames.csv"), index("frames1.csv"));
-        let info: std::collections::HashMap<i64, (i64, i64)> = csv("capture.csv").iter()
-            .map(|r| (r[0].parse().unwrap(), (r[1].parse().unwrap_or(0), r[2].parse().unwrap_or(0)))).collect();
-        let mut times: Vec<i64> = index0.keys().filter(|t| index1.contains_key(t)).copied().collect();
-        times.sort();
-        // IMU: gyro with the latest accelerometer reading, as the app pairs them.
-        let mut accel = [0f32; 3];
-        let mut imu = Vec::new();
-        for r in csv("imu.csv") {
-            let v = [r[2].parse().unwrap(), r[3].parse().unwrap(), r[4].parse().unwrap()];
-            if r[1] == "a" { accel = v } else { imu.push((r[0].parse::<i64>().unwrap(), accel, v)) }
-        }
-
-        let calibration = std::fs::read_to_string(dir.join("calibration.json")).unwrap();
-        let work = std::env::temp_dir().join("marco-tracker-test");
-        let tracker = Tracker::start(&calibration, &work).expect("starts");
+        let rec = Recording::load();
+        let tracker = Tracker::start(&rec.calibration, &std::env::temp_dir().join("marco-tracker-test")).expect("starts");
         let started = std::time::Instant::now();
         let mut poses = Vec::new();
         let mut next_imu = 0;
-        for t in &times {
-            let (exposure, skew) = info.get(t).copied().unwrap_or((0, 0));
-            let moment = t + exposure / 2 + skew / 2;
+        for (_, moment, index) in &rec.captures {
             // Live, readings arrive continuously; Basalt needs those just past each frame.
-            while next_imu < imu.len() && imu[next_imu].0 <= moment + tracker.offset_ns + 20_000_000 {
-                tracker.push_imu(imu[next_imu].0, imu[next_imu].1, imu[next_imu].2);
+            while next_imu < rec.imu.len() && rec.imu[next_imu].0 <= moment + tracker.offset_ns + 20_000_000 {
+                let (t, accel, gyro) = rec.imu[next_imu];
+                tracker.push_imu(t, accel, gyro);
                 next_imu += 1;
             }
-            let frame = |lens: usize, i: usize| {
-                let (w, h) = sizes[lens];
-                &frames[lens][i * (w * h) as usize..(i + 1) * (w * h) as usize]
-            };
-            assert!(tracker.push_frames(moment, (frame(0, index0[t]), sizes[0].0, sizes[0].1), (frame(1, index1[t]), sizes[1].0, sizes[1].1)));
-            poses.extend(tracker.poll());
-            // Real-time pace, as from a camera.
-            std::thread::sleep(std::time::Duration::from_millis(30));
-        }
-        for _ in 0..100 {
-            if poses.len() >= times.len() { break; }
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            // Every frame, waiting while Basalt is busy with earlier ones.
+            while !tracker.push_frames(*moment, rec.frame(0, index[0]), rec.frame(1, index[1])) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
             poses.extend(tracker.poll());
         }
         tracker.stop();
-        let path: f32 = poses.windows(2).map(|w| ((w[1].px - w[0].px).powi(2) + (w[1].py - w[0].py).powi(2) + (w[1].pz - w[0].pz).powi(2)).sqrt()).sum();
-        let (a, b) = (poses.first().unwrap(), poses.last().unwrap());
-        let closing = ((b.px - a.px).powi(2) + (b.py - a.py).powi(2) + (b.pz - a.pz).powi(2)).sqrt();
-        eprintln!("{} poses for {} frames in {:.1} s, path {path:.2} m, start to end {closing:.2} m", poses.len(), times.len(), started.elapsed().as_secs_f64());
-        assert!(poses.len() > times.len() * 9 / 10);
+        report(&poses, rec.captures.len(), started);
+        assert!(poses.len() > rec.captures.len() * 9 / 10);
+    }
+
+    /// As the app drives it, but faster than Basalt keeps up: IMU readings and
+    /// frames on their own threads at 20× the recording's pace (MARCO_SPEED), frames dropped
+    /// while the last is still being pushed, and polling from a third. Pushes
+    /// then block on Basalt's full queues; it must not deadlock.
+    ///
+    ///   MARCO_RECORDING=... LD_LIBRARY_PATH=... cargo test --release keeps_up_when_fed_too_fast -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn keeps_up_when_fed_too_fast() {
+        let speed: f64 = std::env::var("MARCO_SPEED").ok().and_then(|v| v.parse().ok()).unwrap_or(20.0);
+        let rec = Recording::load();
+        let tracker = Tracker::start(&rec.calibration, &std::env::temp_dir().join("marco-tracker-fast")).expect("starts");
+        let t0 = rec.captures[0].0.min(rec.imu[0].0);
+        let started = std::time::Instant::now();
+        // Waits until a recording time comes round at `speed`; false if it had passed by more than `late_ns`.
+        let wait_for = |t: i64, late_ns: i64| -> bool {
+            let due = std::time::Duration::from_secs_f64((t - t0) as f64 / 1e9 / speed);
+            let now = started.elapsed();
+            if now < due {
+                std::thread::sleep(due - now);
+                return true;
+            }
+            (now - due).as_nanos() as i64 <= late_ns
+        };
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let (finished, result) = std::sync::mpsc::channel();
+        // The recording's length at `speed`, plus plenty: past that it is stuck.
+        let watchdog = std::time::Duration::from_secs_f64((rec.imu.last().unwrap().0 - t0) as f64 / 1e9 / speed + 20.0);
+        std::thread::scope(|s| {
+            let (tracker, rec, done, wait_for) = (&tracker, &rec, &done, &wait_for);
+            let imu = s.spawn(move || {
+                for (t, accel, gyro) in &rec.imu {
+                    wait_for(*t, i64::MAX);
+                    tracker.push_imu(*t, *accel, *gyro);
+                }
+            });
+            let frames = s.spawn(move || {
+                let mut pushed = 0;
+                for (t, moment, index) in &rec.captures {
+                    // A frame that came while the last was being pushed is dropped, as in the app.
+                    if wait_for(*t, 1_000_000) && tracker.push_frames(*moment, rec.frame(0, index[0]), rec.frame(1, index[1])) {
+                        pushed += 1;
+                    }
+                }
+                pushed
+            });
+            let poll = s.spawn(move || {
+                let mut poses = Vec::new();
+                while !done.load(std::sync::atomic::Ordering::Acquire) {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    poses.extend(tracker.poll());
+                }
+                poses
+            });
+            s.spawn(move || {
+                imu.join().unwrap();
+                let pushed = frames.join().unwrap();
+                // Let the last poses come out.
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                done.store(true, std::sync::atomic::Ordering::Release);
+                let _ = finished.send((pushed, poll.join().unwrap()));
+            });
+            match result.recv_timeout(watchdog) {
+                Ok((pushed, poses)) => {
+                    eprintln!("{pushed} of {} frames pushed", rec.captures.len());
+                    report(&poses, pushed, started);
+                    assert!(pushed > rec.captures.len() / 10);
+                    assert!(poses.len() > pushed * 8 / 10);
+                }
+                Err(_) => {
+                    eprintln!("deadlocked: no end after {watchdog:?}");
+                    std::process::exit(1);
+                }
+            }
+        });
+        tracker.stop();
     }
 }

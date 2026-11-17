@@ -38,7 +38,7 @@ data class TrackState(
     val rate: Float = 0f,
     /** How long after its frame's moment a pose arrives, ms. */
     val latencyMs: Float = 0f,
-    /** Stereo pairs the camera delivered, and how many were dropped because the last was still being pushed. */
+    /** Stereo pairs the camera delivered, and how many were dropped because Basalt was still busy with earlier ones. */
     val pairs: Int = 0,
     val dropped: Int = 0,
     /** Mean time to bin and push a pair, ms. */
@@ -51,8 +51,8 @@ data class TrackState(
  * its ultrawide and main lenses as a stereo pair plus the gyroscope and
  * accelerometer, using the stereo calibration the [Calibrator] saved.
  *
- * Frames are binned and pushed on one worker thread; if it falls behind, pairs
- * are dropped rather than queued, so tracking stays current. IMU readings go
+ * Frames are binned and pushed on one worker thread; if it or Basalt falls
+ * behind, pairs are dropped rather than queued, so tracking stays current. IMU readings go
  * on another: Basalt's pushes block while it is behind, and one waiting on the
  * other would stall both.
  */
@@ -178,9 +178,12 @@ class Tracking(private val context: Context) {
                 val moment = a.timestampNs + (info?.exposureNs ?: 0) / 2 + (info?.rollingShutterSkewNs ?: 0) / 2
                 val binned0 = Vernier.binLuma(a.luma, a.width, a.height, BIN) ?: return@execute
                 val binned1 = Vernier.binLuma(b.luma, b.width, b.height, BIN) ?: return@execute
-                Vernier.trackerPushFrames(h, moment, binned0, a.width / BIN, a.height / BIN, binned1, b.width / BIN, b.height / BIN)
-                pushNs.addAndGet(System.nanoTime() - started)
-                pushed.incrementAndGet()
+                if (Vernier.trackerPushFrames(h, moment, binned0, a.width / BIN, a.height / BIN, binned1, b.width / BIN, b.height / BIN)) {
+                    pushNs.addAndGet(System.nanoTime() - started)
+                    pushed.incrementAndGet()
+                } else {
+                    dropped.incrementAndGet()
+                }
             } finally {
                 busy.set(false)
             }
