@@ -147,6 +147,18 @@ private fun CalibrateMode() {
                 },
                 style = MaterialTheme.typography.titleMedium,
             )
+            if (s.squarePx > 0f) {
+                val hint = when {
+                    s.squarePx < Calibrator.SMALL_SQUARE_PX -> " — tiny: come closer, or use bigger squares (marco-board +)"
+                    s.squarePx > Calibrator.LARGE_SQUARE_PX -> " — big: step back, or use smaller squares"
+                    else -> ""
+                }
+                Text(
+                    "Squares look %.1f px$hint".format(s.squarePx),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = if (hint.isEmpty()) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.error,
+                )
+            }
             Text(
                 "Hold the board in view — the other phone at 10–20 cm, or a screen running vision/board at " +
                     "30–50 cm — and keep moving: tilt and turn the phone every way, and bring the board into " +

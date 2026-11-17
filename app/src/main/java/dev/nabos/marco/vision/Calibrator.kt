@@ -66,6 +66,8 @@ data class CalibrationState(
     val coverage: Coverage? = null,
     /** Enough of everything: finishing on its own. */
     val ready: Boolean = false,
+    /** How big the board's squares look to the camera, measured (binned) pixels; 0 before the first read. */
+    val squarePx: Float = 0f,
     val preview: ImageBitmap? = null,
     val finishing: Boolean = false,
     val result: CalibrationResult? = null,
@@ -272,12 +274,12 @@ class Calibrator(private val context: Context) {
             if (++measured % 30 == 0) Log.d(TAG, "frame: ${(System.nanoTime() - started) / 1_000_000} ms")
             val s = Vernier.status(handle)
             // Shown upright, like the preview; measuring stays on the sensor's own frame.
-            val coverage = Coverage(columns = s[4], rows = s[5], inset = s[6] / 1000f, cells = s.drop(7).map { it != 0 })
+            val coverage = Coverage(columns = s[5], rows = s[6], inset = s[7] / 1000f, cells = s.drop(8).map { it != 0 })
                 .rotated(rig.sensorOrientation)
             val preview = preview(frame)
             _state.update {
                 it.copy(
-                    points = points, views = s[0], poses = s[1], covered = s[2] / 1000f, ready = s[3] != 0,
+                    points = points, views = s[0], poses = s[1], covered = s[2] / 1000f, ready = s[3] != 0, squarePx = s[4] / 10f,
                     coverage = coverage, preview = preview,
                 )
             }
@@ -377,6 +379,13 @@ class Calibrator(private val context: Context) {
         const val READY_VIEWS = 12
         const val READY_COVERAGE = 0.8f
         const val READY_POSES = 30
+
+        /**
+         * Squares smaller than this in the measured image make frames slow and fragile, larger than
+         * this keep too few in view. Measured pixels, after binning.
+         */
+        const val SMALL_SQUARE_PX = 4f
+        const val LARGE_SQUARE_PX = 16f
 
         /** The least [finish] can calibrate from (vision's MIN_VIEWS). */
         const val MIN_VIEWS = 6

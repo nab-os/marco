@@ -36,7 +36,10 @@ object Vernier {
     /** Keeps the last measured frame for the lens if it shows the board in a new way; returns views kept. */
     @JvmStatic external fun keep(handle: Long): Int
 
-    /** `[views, poses, coverage ‰, ready, columns, rows, inset ‰, cell…]`; cells are 1 where the board has been. */
+    /**
+     * `[views, poses, coverage ‰, ready, square px × 10, columns, rows, inset ‰, cell…]`; the square is
+     * as big as the board's squares looked in the last frame, and cells are 1 where the board has been.
+     */
     @JvmStatic external fun status(handle: Long): IntArray
 
     /** [count] gyro readings: [times] in ns, [rates] as x, y, z triples in rad/s. */

@@ -110,6 +110,8 @@ pub struct Session {
     gyro: Vec<GyroSample>,
     /// Which cells of the frame the kept views' points have visited.
     covered: [bool; COVER_COLUMNS * COVER_ROWS],
+    /// Side of a board square in the last frame read, binned pixels.
+    square_px: f64,
 }
 
 /// A measured frame, stamped at the middle of the exposure of the board's
@@ -127,6 +129,8 @@ pub struct Status {
     /// Fraction of the frame's cells the board has visited.
     pub coverage: f64,
     pub ready: bool,
+    /// How big the board's squares looked in the last frame read, binned pixels.
+    pub square_px: f64,
 }
 
 impl Session {
@@ -147,6 +151,7 @@ impl Session {
             frames: Vec::new(),
             gyro: Vec::new(),
             covered: [false; COVER_COLUMNS * COVER_ROWS],
+            square_px: 0.0,
         }
     }
 
@@ -211,6 +216,8 @@ impl Session {
         };
         match measured {
             Ok(view) if view.is_absolute() => {
+                // The carriers run along the squares' diagonals.
+                self.square_px = view.period / std::f64::consts::SQRT_2;
                 self.previous = Some(view.clone());
                 Some(view)
             }
@@ -268,6 +275,7 @@ impl Session {
             poses: self.frames.len(),
             coverage,
             ready: self.views.len() >= READY_VIEWS && coverage >= READY_COVERAGE && self.frames.len() >= READY_POSES,
+            square_px: self.square_px,
         }
     }
 
@@ -275,12 +283,18 @@ impl Session {
         self.gyro.extend(samples);
     }
 
-    /// Calibrates with each lens model and keeps the one that fits best.
-    /// Returns it, with every model's rms.
+    /// Calibrates with each lens model and picks one. Returns it, with every
+    /// model's rms and whether it holds out to the corners.
     ///
     /// A wide lens can be anything from nearly rectilinear (a phone's
-    /// ultrawide, corrected optically) to a true fisheye: the data decides.
-    pub fn calibrate_best(&self) -> Result<(Calibration, Vec<(Model, f64)>), CalibrationError> {
+    /// ultrawide, corrected optically) to a true fisheye, so both are fitted.
+    /// But Vernier never measures the outer band of the frame, where a model
+    /// only extrapolates, and a fisheye's high-order terms can turn over
+    /// there: the Pixel 7a ultrawide's fit stays one-to-one only up to 70°,
+    /// just past its corners at 60°. So a model must be [`sane_to_corners`],
+    /// and the fisheye must fit clearly better ([`FISHEYE_MARGIN`]) to beat
+    /// the pinhole, the model phone makers calibrate with.
+    pub fn calibrate_best(&self) -> Result<(Calibration, Vec<ModelFit>), CalibrationError> {
         if self.views.len() < MIN_VIEWS {
             return Err(CalibrationError::TooFewViews(self.views.len()));
         }
@@ -292,19 +306,35 @@ impl Session {
                 Err(error) => failure = error,
             }
         }
-        let rms = fitted.iter().map(|(model, calibration)| (*model, calibration.rms)).collect();
-        let (_, best) = fitted
+        let fits: Vec<ModelFit> = fitted
+            .iter()
+            .map(|(model, calibration)| ModelFit {
+                model: *model,
+                rms: calibration.rms,
+                sane: sane_to_corners(&calibration.camera),
+            })
+            .collect();
+        let rms_of = |model| fits.iter().find(|fit| fit.model == model && fit.sane).map(|fit| fit.rms);
+        let chosen = match (rms_of(Model::Pinhole), rms_of(Model::Fisheye)) {
+            (Some(pinhole), Some(fisheye)) => Some(if fisheye < pinhole * FISHEYE_MARGIN { Model::Fisheye } else { Model::Pinhole }),
+            (Some(_), None) => Some(Model::Pinhole),
+            (None, Some(_)) => Some(Model::Fisheye),
+            // Neither holds to the corners: the best fit at least, flagged insane in the report.
+            (None, None) => fits.iter().min_by(|a, b| a.rms.total_cmp(&b.rms)).map(|fit| fit.model),
+        };
+        let best = fitted
             .into_iter()
-            .min_by(|a, b| a.1.rms.total_cmp(&b.1.rms))
+            .find(|(model, _)| Some(*model) == chosen)
+            .map(|(_, calibration)| calibration)
             .ok_or(failure)?;
-        Ok((best, rms))
+        Ok((best, fits))
     }
 
     /// Calibrates the lens, then solves every measured frame's pose with it
     /// and aligns those poses with the gyroscope. The alignment can fail on
     /// its own (too little turning, no gyroscope) without losing the lens.
     pub fn finish(&self) -> Result<Finished, CalibrationError> {
-        let (calibration, rms_by_model) = self.calibrate_best()?;
+        let (calibration, fits) = self.calibrate_best()?;
         let orientations: Vec<CameraOrientation> = self
             .frames
             .iter()
@@ -317,14 +347,59 @@ impl Session {
             })
             .collect();
         let alignment = imu::align(&orientations, &self.gyro);
-        Ok(Finished { calibration, rms_by_model, alignment })
+        Ok(Finished { calibration, fits, alignment })
     }
+}
+
+/// One lens model's fit.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ModelFit {
+    pub model: Model,
+    pub rms: f64,
+    /// See [`sane_to_corners`].
+    pub sane: bool,
+}
+
+/// The fisheye has to fit this much better than the pinhole to be chosen.
+pub const FISHEYE_MARGIN: f64 = 0.9;
+
+/// Whether `camera` maps angles off its axis to radii one-to-one all the way
+/// to each corner of the frame: going out from the principal point toward a
+/// corner, the projected radius must keep growing until it gets there.
+pub fn sane_to_corners(camera: &Camera) -> bool {
+    let (width, height) = (camera.width as f64, camera.height as f64);
+    let max_angle = match camera.model {
+        Model::Pinhole => 89.0f64,
+        Model::Fisheye => 120.0,
+    };
+    [[0.0, 0.0], [width, 0.0], [0.0, height], [width, height]].iter().all(|corner| {
+        let (du, dv) = (corner[0] - camera.cx, corner[1] - camera.cy);
+        let reach = du.hypot(dv);
+        let azimuth = (dv / camera.fy).atan2(du / camera.fx);
+        let mut last = 0.0;
+        for step in 1..=(max_angle * 4.0) as usize {
+            let theta = (step as f64 * 0.25).to_radians();
+            let ray = Vector3::new(theta.sin() * azimuth.cos(), theta.sin() * azimuth.sin(), theta.cos());
+            let Some(pixel) = camera.project(&ray) else {
+                return false;
+            };
+            let radius = (pixel[0] - camera.cx).hypot(pixel[1] - camera.cy);
+            if radius <= last {
+                return false;
+            }
+            if radius >= reach {
+                return true;
+            }
+            last = radius;
+        }
+        false
+    })
 }
 
 /// What [`Session::finish`] found.
 pub struct Finished {
     pub calibration: Calibration,
-    pub rms_by_model: Vec<(Model, f64)>,
+    pub fits: Vec<ModelFit>,
     pub alignment: Result<CameraImu, ImuError>,
 }
 
@@ -332,12 +407,11 @@ impl Finished {
     /// The [`Report`] with `rms_by_model`, and `imu` or `imu_error`.
     pub fn to_json(&self) -> serde_json::Value {
         let mut json = serde_json::to_value(Report::from(&self.calibration)).unwrap_or_default();
-        let by_model: serde_json::Map<String, serde_json::Value> = self
-            .rms_by_model
-            .iter()
-            .map(|(model, rms)| (format!("{model:?}").to_lowercase(), (*rms).into()))
-            .collect();
+        let name = |model: Model| format!("{model:?}").to_lowercase();
+        let by_model: serde_json::Map<String, serde_json::Value> =
+            self.fits.iter().map(|fit| (name(fit.model), fit.rms.into())).collect();
         json["rms_by_model"] = by_model.into();
+        json["sane_to_corners"] = self.fits.iter().map(|fit| (name(fit.model), fit.sane.into())).collect::<serde_json::Map<_, _>>().into();
         match &self.alignment {
             Ok(alignment) => json["imu"] = serde_json::to_value(alignment).unwrap_or_default(),
             Err(error) => json["imu_error"] = error.to_string().into(),
@@ -557,8 +631,8 @@ pub extern "system" fn Java_dev_nabos_marco_vision_Vernier_keep(
     })
 }
 
-/// `[views, poses, coverage ‰, ready, columns, rows, inset ‰, cell…]`, cells
-/// row-major, 1 where the board has been.
+/// `[views, poses, coverage ‰, ready, square px × 10, columns, rows, inset ‰,
+/// cell…]`, cells row-major, 1 where the board has been.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_dev_nabos_marco_vision_Vernier_status(
     env: JNIEnv,
@@ -573,6 +647,7 @@ pub extern "system" fn Java_dev_nabos_marco_vision_Vernier_status(
             status.poses as jint,
             (status.coverage * 1000.0).round() as jint,
             status.ready as jint,
+            (status.square_px * 10.0).round() as jint,
             COVER_COLUMNS as jint,
             COVER_ROWS as jint,
             (COVER_INSET * 1000.0).round() as jint,
@@ -650,6 +725,7 @@ mod tests {
         let mut session = Session::new(Response::Srgb, 1);
         let points = session.measure(&pixels, width, height, width, 0, 0, 0).expect("code read");
         assert!(points >= MIN_POINTS, "{points} points");
+        assert!((session.status().square_px - 12.0).abs() < 0.1, "square {}", session.status().square_px);
         assert!(session.keep());
         let coverage = session.status().coverage;
         assert_eq!(coverage, 1.0, "a board filling the frame covers all it can");
@@ -843,7 +919,28 @@ mod tests {
             session.status(),
             measuring / 60,
             started.elapsed(),
-            finished.rms_by_model,
+            finished.fits,
         );
+    }
+
+    /// The Pixel 7a ultrawide at 640×480: its fisheye fit turns over at 70°,
+    /// just past the corners (60°), so it passes; with a stronger last term it
+    /// would turn over at about 50°, short of them.
+    #[test]
+    fn rejects_a_fisheye_that_folds_before_the_corners() {
+        let mut pixel = Camera::ideal(Model::Fisheye, 640, 480, 255.66, 255.51, 323.34, 239.12);
+        pixel.distortion = vec![0.4368, -0.2818, 0.8102, -0.4810];
+        assert!(sane_to_corners(&pixel));
+        let mut folding = pixel.clone();
+        folding.distortion[3] = -1.2;
+        assert!(!sane_to_corners(&folding));
+
+        let mut factory = Camera::ideal(Model::Pinhole, 640, 480, 251.54, 251.54, 321.56, 238.50);
+        factory.distortion = vec![0.0142, -0.0220, -0.0004, 0.0002, 0.0098];
+        assert!(sane_to_corners(&factory));
+
+        let mut fisheye = Camera::ideal(Model::Fisheye, 640, 480, 330.0, 331.0, 318.0, 243.0);
+        fisheye.distortion = vec![0.02, -0.01, 0.003, -0.0008];
+        assert!(sane_to_corners(&fisheye), "a well-behaved fisheye passes");
     }
 }
