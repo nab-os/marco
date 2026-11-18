@@ -1,6 +1,8 @@
 package dev.nabos.marco.vision
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.Matrix
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
@@ -90,6 +92,10 @@ class Tracking(private val context: Context) {
     private val _state = MutableStateFlow(TrackState())
     val state: StateFlow<TrackState> = _state.asStateFlow()
 
+    /** What the main lens sees, small and upright, a few times a second: to show the cameras are on. */
+    val preview = MutableStateFlow<Bitmap?>(null)
+    private var lastPreviewNs = 0L
+
     fun start(scope: CoroutineScope) {
         if (_state.value.running) return
         if (!Vernier.available) return fail("This build has no Vernier (build with marco.vision=true).")
@@ -178,6 +184,10 @@ class Tracking(private val context: Context) {
                 val moment = a.timestampNs + (info?.exposureNs ?: 0) / 2 + (info?.rollingShutterSkewNs ?: 0) / 2
                 val binned0 = Vernier.binLuma(a.luma, a.width, a.height, BIN) ?: return@execute
                 val binned1 = Vernier.binLuma(b.luma, b.width, b.height, BIN) ?: return@execute
+                if (started - lastPreviewNs > PREVIEW_EVERY_NS) {
+                    lastPreviewNs = started
+                    preview.value = thumbnail(binned1, b.width / BIN, b.height / BIN)
+                }
                 if (Vernier.trackerPushFrames(h, moment, binned0, a.width / BIN, a.height / BIN, binned1, b.width / BIN, b.height / BIN)) {
                     pushNs.addAndGet(System.nanoTime() - started)
                     pushed.incrementAndGet()
@@ -262,11 +272,24 @@ class Tracking(private val context: Context) {
 
     private fun fail(message: String) = _state.update { it.copy(error = message) }
 
+    /** A binned luma frame as a bitmap, turned upright for a portrait screen. */
+    private fun thumbnail(luma: ByteArray, width: Int, height: Int): Bitmap {
+        val pixels = IntArray(width * height)
+        for (i in pixels.indices) {
+            val g = luma[i].toInt() and 0xFF
+            pixels[i] = (0xFF shl 24) or (g shl 16) or (g shl 8) or g
+        }
+        val flat = Bitmap.createBitmap(pixels, width, height, Bitmap.Config.ARGB_8888)
+        val turn = Matrix().apply { postRotate(rig.sensorOrientation.toFloat()) }
+        return Bitmap.createBitmap(flat, 0, 0, width, height, turn, false)
+    }
+
     companion object {
         private const val BIN = 2
         /** 20 ms of readings: Basalt waits for those past a frame before releasing its pose. */
         private const val IMU_BATCH = 4
         private const val POLL_MS = 50L
+        private const val PREVIEW_EVERY_NS = 250_000_000L
         private const val MAX_PAIR_WAIT_NS = 200_000_000L
 
         /** The camera's z axis in IMU axes: the inverse of the calibrated gyro-to-camera rotation applied to z. */

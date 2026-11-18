@@ -7,6 +7,8 @@ import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -17,6 +19,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.MaterialTheme
@@ -29,7 +32,9 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
@@ -158,6 +163,20 @@ fun FindScreen(modifier: Modifier, peer: Peer, onBack: () -> Unit) {
             Box(Modifier.fillMaxWidth().weight(1f)) {
                 SignalMapView(m, youColor = if (s.stale) MaterialTheme.colorScheme.onSurface else heat, Modifier.fillMaxSize())
                 Text(heatLine(s), Modifier.align(Alignment.TopStart), style = MaterialTheme.typography.labelLarge, color = heat)
+                // What the cameras see: the map is drawn from them.
+                Column(Modifier.align(Alignment.TopEnd), horizontalAlignment = Alignment.End) {
+                    m.preview?.let { frame ->
+                        Image(
+                            frame.asImageBitmap(), "What the cameras see",
+                            Modifier.width(88.dp).clip(RoundedCornerShape(6.dp)).border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(6.dp)),
+                        )
+                    }
+                    Text(
+                        if (m.preview != null) "Cameras tracking you" else "Cameras starting…",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             }
             Text(mapHeadline(m), fontSize = 32.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
             Text(mapDetail(m), style = MaterialTheme.typography.bodyMedium, textAlign = TextAlign.Center)

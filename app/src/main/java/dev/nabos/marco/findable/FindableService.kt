@@ -90,6 +90,7 @@ class FindableService : Service() {
         store = PeerStore.get(this)
         notifications = getSystemService(NotificationManager::class.java)!!
         createChannels()
+        ServiceLog.log(this, "service created")
         ringer = Ringer(this).apply {
             onStateChanged = { ringing ->
                 _status.update { it.copy(ringing = ringing) }
@@ -99,6 +100,7 @@ class FindableService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        ServiceLog.log(this, "start: ${intent?.action ?: "sync"}" + if (intent == null) " (restarted by the system)" else "")
         when (intent?.action) {
             ACTION_STOP_RING -> {
                 ringer.stop()
@@ -113,9 +115,11 @@ class FindableService : Service() {
 
         try {
             startForeground(NOTIF_ONGOING, ongoingNotification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
+            ServiceLog.log(this, "in the foreground")
         } catch (e: Exception) {
             // Missing BLE permission, or started from the background where not allowed.
             Log.e(TAG, "startForeground failed", e)
+            ServiceLog.log(this, "startForeground failed: $e")
             _status.value = FindableStatus(error = "Couldn't start: ${e.javaClass.simpleName}")
             stopSelf()
             return START_NOT_STICKY
@@ -132,7 +136,12 @@ class FindableService : Service() {
                 store.peers.collect { list ->
                     peers = list
                     nonces.clear()
-                    if (list.isEmpty()) stopSelf() else restartRadio()
+                    if (list.isEmpty()) {
+                        ServiceLog.log(this@FindableService, "no paired phones: stopping")
+                        stopSelf()
+                    } else {
+                        restartRadio()
+                    }
                 }
             }
         }
@@ -142,6 +151,7 @@ class FindableService : Service() {
     private var started = false
 
     override fun onDestroy() {
+        ServiceLog.log(this, "destroyed")
         main.removeCallbacksAndMessages(null)
         ringer.stop()
         stopRadio()
@@ -149,6 +159,13 @@ class FindableService : Service() {
         scope.cancel()
         _status.value = FindableStatus()
         super.onDestroy()
+    }
+
+    /** The user swiped the app away: some phones kill the process with it; come back soon. */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        ServiceLog.log(this, "task removed")
+        Watchdog.schedule(this, inMs = 3_000)
+        super.onTaskRemoved(rootIntent)
     }
 
     // --- radio ---------------------------------------------------------------
@@ -438,8 +455,14 @@ class FindableService : Service() {
             if (want) {
                 runCatching {
                     ContextCompat.startForegroundService(context, Intent(context, FindableService::class.java))
-                }.onFailure { Log.e(TAG, "Couldn't start service", it) }
+                }.onFailure {
+                    Log.e(TAG, "Couldn't start service", it)
+                    ServiceLog.log(context, "sync: couldn't start: $it")
+                }
+                Watchdog.schedule(context)
             } else {
+                ServiceLog.log(context, "sync: not wanted (paired=${store.peers.value.isNotEmpty()} findable=${store.findable.value} ble=${Perms.hasBle(context)})")
+                Watchdog.cancel(context)
                 context.stopService(Intent(context, FindableService::class.java))
             }
         }
