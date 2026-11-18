@@ -48,6 +48,8 @@ import androidx.core.content.ContextCompat
 import dev.nabos.marco.vision.CalibrationBoard
 import dev.nabos.marco.vision.Coverage
 import dev.nabos.marco.vision.Calibrator
+import dev.nabos.marco.acoustic.ChirpPlayer
+import dev.nabos.marco.acoustic.ChirpRecorder
 import dev.nabos.marco.vision.Recorder
 import dev.nabos.marco.vision.TrackPoint
 import dev.nabos.marco.vision.Tracking
@@ -75,7 +77,7 @@ class LabActivity : ComponentActivity() {
     }
 }
 
-private enum class Mode { MENU, BOARD, CALIBRATE, RECORD, STEREO, TRACK }
+private enum class Mode { MENU, BOARD, CALIBRATE, RECORD, STEREO, TRACK, CHIRPS, LISTEN }
 
 @Composable
 private fun Lab(initial: Mode) {
@@ -86,6 +88,10 @@ private fun Lab(initial: Mode) {
         mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED)
     }
     val askCamera = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { cameraOk = it }
+    var micOk by remember {
+        mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED)
+    }
+    val askMic = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { micOk = it }
 
     when (mode) {
         Mode.BOARD -> CalibrationBoard()
@@ -93,6 +99,8 @@ private fun Lab(initial: Mode) {
         Mode.RECORD -> if (cameraOk) RecordMode() else NeedCamera { askCamera.launch(Manifest.permission.CAMERA) }
         Mode.STEREO -> if (cameraOk) StereoMode() else NeedCamera { askCamera.launch(Manifest.permission.CAMERA) }
         Mode.TRACK -> if (cameraOk) TrackMode() else NeedCamera { askCamera.launch(Manifest.permission.CAMERA) }
+        Mode.CHIRPS -> ChirpsMode()
+        Mode.LISTEN -> if (micOk) ListenMode() else NeedCamera("The microphone is needed for this.", "Allow microphone") { askMic.launch(Manifest.permission.RECORD_AUDIO) }
         Mode.MENU -> Column(
             Modifier.safeDrawingPadding().padding(24.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
@@ -104,6 +112,8 @@ private fun Lab(initial: Mode) {
             OutlinedButton({ mode = Mode.RECORD }, Modifier.fillMaxWidth()) { Text("Record camera + motion") }
             Button({ mode = Mode.TRACK }, Modifier.fillMaxWidth(), enabled = Vernier.available) { Text("Track (Basalt)") }
             OutlinedButton({ mode = Mode.STEREO }, Modifier.fillMaxWidth()) { Text("Stereo test") }
+            OutlinedButton({ mode = Mode.CHIRPS }, Modifier.fillMaxWidth()) { Text("Play test chirps") }
+            OutlinedButton({ mode = Mode.LISTEN }, Modifier.fillMaxWidth()) { Text("Record audio (20 s)") }
             Text(
                 "Show the board on one phone and calibrate on the other. Recordings and calibrations go to " +
                     "Android/data/dev.nabos.marco/files/. To record with the Bluetooth signal, use Record on the Find screen.",
@@ -114,10 +124,48 @@ private fun Lab(initial: Mode) {
 }
 
 @Composable
-private fun NeedCamera(ask: () -> Unit) {
+private fun NeedCamera(what: String = "The camera is needed for this.", button: String = "Allow camera", ask: () -> Unit) {
     Column(Modifier.safeDrawingPadding().padding(24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-        Text("The camera is needed for this.")
-        Button(ask) { Text("Allow camera") }
+        Text(what)
+        Button(ask) { Text(button) }
+    }
+}
+
+/** Plays the acoustic test track, on the phone to be found. */
+@Composable
+private fun ChirpsMode() {
+    val context = LocalContext.current
+    val player = remember { ChirpPlayer(context.applicationContext) }
+    DisposableEffect(player) {
+        player.start()
+        onDispose { player.stop() }
+    }
+    Column(Modifier.safeDrawingPadding().padding(24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+        Text("Playing test chirps", style = MaterialTheme.typography.headlineSmall)
+        Text(
+            "Once a second: a chirp at 2–5 kHz, one at 8–12 kHz and one at 16.5–20 kHz, at alarm volume. " +
+                "Record on the other phone: held a metre away, then with this one in a drawer, under a cushion, in a bag.",
+        )
+        Text("Back stops it.", style = MaterialTheme.typography.bodySmall)
+    }
+}
+
+/** Records 20 s of raw audio, on the searching phone. */
+@Composable
+private fun ListenMode() {
+    val context = LocalContext.current
+    val recorder = remember { ChirpRecorder(context.applicationContext) }
+    DisposableEffect(recorder) {
+        recorder.start(20)
+        onDispose { recorder.stop() }
+    }
+    val s by recorder.stats.collectAsStateWithLifecycle()
+    Column(Modifier.safeDrawingPadding().padding(24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+        Text(if (s.recording) "Recording… %.0f s".format(s.seconds) else if (s.error != null) "Failed" else "Done: ${s.file}", style = MaterialTheme.typography.headlineSmall)
+        Text("Source: ${s.source} · peak level %.2f".format(s.peak))
+        s.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+        Text("Files go to Android/data/dev.nabos.marco/files/acoustic/. Keep the phone still while it records.", style = MaterialTheme.typography.bodySmall)
+        if (!s.recording) Button({ recorder.start(20) }) { Text("Record again") }
     }
 }
 
