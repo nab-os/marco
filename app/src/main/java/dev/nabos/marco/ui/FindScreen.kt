@@ -7,6 +7,7 @@ import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
@@ -32,7 +33,11 @@ import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.platform.LocalContext
@@ -173,10 +178,11 @@ fun FindScreen(modifier: Modifier, peer: Peer, onBack: () -> Unit) {
                 // What the cameras see: the map is drawn from them.
                 Column(Modifier.align(Alignment.TopEnd), horizontalAlignment = Alignment.End) {
                     m.preview?.let { frame ->
-                        Image(
-                            frame.asImageBitmap(), "What the cameras see",
-                            Modifier.width(88.dp).clip(RoundedCornerShape(6.dp)).border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(6.dp)),
-                        )
+                        Box(Modifier.width(120.dp).clip(RoundedCornerShape(6.dp)).border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(6.dp))) {
+                            Image(frame.asImageBitmap(), "What the cameras see", Modifier.fillMaxWidth())
+                            // A bar where the phone is across the view; an arrow at the edge when it's out of it.
+                            targetAcrossFeed(m)?.let { u -> FeedBar(u, targetColour(m), Modifier.matchParentSize()) }
+                        }
                     }
                     Text(
                         if (m.preview != null) "Cameras tracking you" else "Cameras starting…",
@@ -231,6 +237,30 @@ fun FindScreen(modifier: Modifier, peer: Peer, onBack: () -> Unit) {
 }
 
 private fun debuggable(context: Context) = (context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
+
+/** A vertical bar at [u] (0..1 across) over the feed, or a chevron at the edge it's beyond. */
+@Composable
+private fun FeedBar(u: Float, colour: Color, modifier: Modifier) {
+    Canvas(modifier) {
+        val w = size.width
+        val h = size.height
+        if (u in 0f..1f) {
+            val x = u * w
+            drawRect(colour.copy(alpha = 0.35f), Offset(x - 5.dp.toPx(), 0f), Size(10.dp.toPx(), h))
+            drawRect(colour, Offset(x - 1.5.dp.toPx(), 0f), Size(3.dp.toPx(), h))
+        } else {
+            val atRight = u > 1f
+            val x = if (atRight) w - 10.dp.toPx() else 10.dp.toPx()
+            val dir = if (atRight) 1f else -1f
+            val chevron = Path().apply {
+                moveTo(x - dir * 6.dp.toPx(), h / 2 - 9.dp.toPx())
+                lineTo(x + dir * 2.dp.toPx(), h / 2)
+                lineTo(x - dir * 6.dp.toPx(), h / 2 + 9.dp.toPx())
+            }
+            drawPath(chevron, colour, style = Stroke(3.dp.toPx()))
+        }
+    }
+}
 
 @Composable
 private fun debuggable() = debuggable(LocalContext.current)

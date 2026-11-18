@@ -95,6 +95,13 @@ class Tracking(private val context: Context) {
     /** What the main lens sees, small and upright, a few times a second: to show the cameras are on. */
     val preview = MutableStateFlow<Bitmap?>(null)
     private var lastPreviewNs = 0L
+    /**
+     * Tangent of half the preview's horizontal field of view: upright, the preview's
+     * width is the sensor's height, so the main lens's `fy` over half that height.
+     * 0 until the calibration is read.
+     */
+    @Volatile var previewHalfFovTan = 0f
+        private set
 
     fun start(scope: CoroutineScope) {
         if (_state.value.running) return
@@ -106,6 +113,11 @@ class Tracking(private val context: Context) {
             ?: return fail("Calibrate this camera first (Marco Lab → Calibrate this camera).")
         if (!calibration.has("stereo")) return fail("The calibration has no stereo pose: calibrate again with both lenses.")
         cameraAxis = cameraAxisInImu(calibration)
+        previewHalfFovTan = calibration.optJSONObject("second")?.optJSONObject("camera")?.let { lens ->
+            val fy = lens.optDouble("fy", 0.0)
+            val height = lens.optDouble("height", (second.height / BIN).toDouble())
+            if (fy > 0) (height / 2.0 / fy).toFloat() else 0f
+        } ?: 0f
 
         val started = JSONObject(Vernier.trackerStart(calibration.toString(), File(context.filesDir, "basalt").path))
         if (started.has("error")) return fail(started.getString("error"))

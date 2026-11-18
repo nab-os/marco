@@ -107,6 +107,29 @@ private fun androidx.compose.ui.graphics.drawscope.DrawScope.heat(e: SignalMap.E
     }
 }
 
+/**
+ * Where the phone is across the camera feed, 0 (left edge) to 1 (right edge), from
+ * the angle between where the camera points and the phone; outside that range when
+ * it is out of view (beyond ±1 means behind). Null without a target or a lens.
+ */
+fun targetAcrossFeed(m: MapState): Float? {
+    val here = m.here ?: return null
+    if (m.previewHalfFovTan <= 0f) return null
+    val (tx, ty) = m.acoustic?.let { it.x to it.y }
+        ?: m.estimate?.takeIf { it.spreadM <= UNSURE_M }?.let { it.x to it.y }
+        ?: return null
+    val dx = tx - here.x
+    val dy = ty - here.y
+    val ahead = dx * here.headingX + dy * here.headingY
+    val right = dx * here.headingY - dy * here.headingX
+    if (ahead <= 0.0) return if (right >= 0) 2f else -2f // behind: an arrow at the edge
+    val u = 0.5 + (right / ahead) / (2 * m.previewHalfFovTan)
+    return u.toFloat().coerceIn(-1.5f, 2.5f)
+}
+
+/** The target's colour: the sound fix when there is one, else the signal map's. */
+fun targetColour(m: MapState): Color = if (m.acoustic != null) SOUND else HOT
+
 /** What to do next, in words: where the phone likely is from where you stand. */
 fun mapHeadline(m: MapState): String {
     val here = m.here ?: return "Starting the cameras…"

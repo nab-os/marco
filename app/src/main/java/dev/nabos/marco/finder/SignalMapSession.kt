@@ -35,8 +35,9 @@ data class MapState(
     val track: TrackState = TrackState(),
     /** Where you are now and which way you face. */
     val here: TrackPoint? = null,
-    /** What the cameras see, to show they're on. */
+    /** What the cameras see, to show they're on, and the tangent of half its horizontal field of view. */
     val preview: android.graphics.Bitmap? = null,
+    val previewHalfFovTan: Float = 0f,
     val estimate: SignalMap.Estimate? = null,
     /** Readings placed on the map so far. */
     val readings: Int = 0,
@@ -94,7 +95,7 @@ class SignalMapSession(private val context: Context, private val scope: Coroutin
         log = openLog()
         _state.value = MapState(running = true, track = t.state.value)
         jobs += scope.launch { t.state.collect(::onTrack) }
-        jobs += scope.launch { t.preview.collect { p -> _state.update { it.copy(preview = p) } } }
+        jobs += scope.launch { t.preview.collect { p -> _state.update { it.copy(preview = p, previewHalfFovTan = t.previewHalfFovTan) } } }
         jobs += scope.launch {
             engine.samples.collect {
                 pending.addLast(it)
