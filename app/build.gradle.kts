@@ -40,6 +40,12 @@ android {
         }
     }
 
+    lint {
+        // Lint's release pass crashes analysing the applied vision.gradle.kts script
+        // (a lint bug with Kotlin build scripts); `./gradlew lint` still runs on demand.
+        checkReleaseBuilds = false
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
@@ -72,6 +78,8 @@ dependencies {
 
     // QR code generation + scanning for pairing (no Google Play Services needed).
     implementation("com.journeyapps:zxing-android-embedded:4.3.0")
+
+    testImplementation("junit:junit:4.13.2")
 }
 
 // Optional native Vernier bridge, see vision.gradle.kts.
