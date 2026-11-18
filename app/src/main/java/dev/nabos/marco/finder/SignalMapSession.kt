@@ -1,7 +1,12 @@
 package dev.nabos.marco.finder
 
+import android.Manifest
 import android.content.Context
+import android.content.pm.PackageManager
 import android.util.Log
+import androidx.core.content.ContextCompat
+import dev.nabos.marco.acoustic.AcousticRanging
+import dev.nabos.marco.acoustic.ChirpListener
 import dev.nabos.marco.vision.TrackPoint
 import dev.nabos.marco.vision.TrackState
 import dev.nabos.marco.vision.Tracking
@@ -13,6 +18,8 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -31,6 +38,13 @@ data class MapState(
     val estimate: SignalMap.Estimate? = null,
     /** Readings placed on the map so far. */
     val readings: Int = 0,
+    /** Where the other phone's ring puts it, by sound, once it rings and you move. */
+    val acoustic: AcousticRanging.Fix? = null,
+    /** Chirps heard and placed on the path so far. */
+    val chirps: Int = 0,
+    /** Listening to the ring, or why not. */
+    val listening: Boolean = false,
+    val micError: String? = null,
 )
 
 /**
@@ -38,8 +52,12 @@ data class MapState(
  * with the cameras ([Tracking]), places each RSSI reading where you were when
  * it was measured, and keeps a [SignalMap] estimate of where the other phone is.
  *
- * Readings are also written to `files/maps/` (time, position, heading, RSSI),
- * to tune the map offline against real searches.
+ * While the other phone rings, its ring is the chirp train ([ChirpListener]):
+ * each chirp heard is placed on the path too, and [AcousticRanging] turns
+ * their arrival times into a position good to centimetres.
+ *
+ * Readings and chirps are also written to `files/maps/`, to tune offline
+ * against real searches.
  */
 class SignalMapSession(private val context: Context, private val scope: CoroutineScope, private val engine: FinderEngine) {
 
@@ -50,6 +68,12 @@ class SignalMapSession(private val context: Context, private val scope: Coroutin
     private val pending = ArrayDeque<RssiSample>()
     private var path: List<TrackPoint> = emptyList()
     private var log: Writer? = null
+    private var logName = ""
+    private var listener: ChirpListener? = null
+    private val pendingChirps = ArrayDeque<Pair<Long, Double>>()
+    private val chirpObs = ArrayList<AcousticRanging.Observation>()
+    private val ranging = AcousticRanging()
+    private var chirpLog: Writer? = null
 
     private val _state = MutableStateFlow(MapState())
     val state: StateFlow<MapState> = _state.asStateFlow()
@@ -75,17 +99,63 @@ class SignalMapSession(private val context: Context, private val scope: Coroutin
             }
         }
         jobs += scope.launch {
+            engine.state.map { it.ringing }.distinctUntilChanged().collect { ringing -> if (ringing) startListening() else stopListening() }
+        }
+        jobs += scope.launch {
             while (isActive) {
                 delay(ESTIMATE_EVERY_MS)
                 val estimate = withContext(Dispatchers.Default) { map.estimate() } ?: continue
-                _state.update { it.copy(estimate = estimate) }
+                // The chirps start from the map's spot, or the last fix: a straight path can't tell the sides.
+                val from = _state.value.acoustic
+                val obs = synchronized(chirpObs) { chirpObs.toList() }
+                val fix = if (obs.size >= AcousticRanging.MIN_CHIRPS) {
+                    withContext(Dispatchers.Default) { ranging.solve(obs, from?.x ?: estimate.x, from?.y ?: estimate.y) }
+                } else {
+                    null
+                }
+                _state.update { it.copy(estimate = estimate, acoustic = fix ?: it.acoustic) }
             }
         }
+    }
+
+    private fun startListening() {
+        if (listener != null) return
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            _state.update { it.copy(micError = "Allow the microphone to place the ring by sound.") }
+            return
+        }
+        chirpLog = runCatching {
+            File(File(context.getExternalFilesDir(null), "maps"), "$logName-chirps.csv").bufferedWriter().apply { write("t_ns,x,y,z,margin_db\n") }
+        }.getOrNull()
+        val l = ChirpListener(context.applicationContext) { tNs, margin ->
+            scope.launch {
+                pendingChirps.addLast(tNs to margin)
+                place()
+            }
+        }
+        l.start()
+        l.error?.let { e ->
+            _state.update { it.copy(micError = e) }
+            return
+        }
+        listener = l
+        _state.update { it.copy(listening = true, micError = null) }
+    }
+
+    private fun stopListening() {
+        listener?.stop()
+        listener = null
+        runCatching { chirpLog?.close() }
+        chirpLog = null
+        _state.update { it.copy(listening = false) }
     }
 
     fun stop() {
         jobs.forEach { it.cancel() }
         jobs.clear()
+        stopListening()
+        synchronized(chirpObs) { chirpObs.clear() }
+        pendingChirps.clear()
         tracking?.close()
         tracking = null
         if (_state.value.running) engine.fastPoll = false
@@ -120,7 +190,18 @@ class SignalMapSession(private val context: Context, private val scope: Coroutin
                 }
             }
         }
-        _state.update { it.copy(readings = map.readings) }
+        while (pendingChirps.isNotEmpty()) {
+            val (tNs, margin) = pendingChirps.first()
+            if (tNs > last.tNs) {
+                if (last.tNs < tNs - MAX_WAIT_NS) pendingChirps.removeFirst() else break
+                continue
+            }
+            pendingChirps.removeFirst()
+            val at = poseAt(tNs) ?: continue
+            synchronized(chirpObs) { chirpObs += AcousticRanging.Observation(tNs, at.x.toDouble(), at.y.toDouble(), at.z.toDouble()) }
+            chirpLog?.let { w -> runCatching { w.write("$tNs,${at.x},${at.y},${at.z},${"%.1f".format(margin)}\n") } }
+        }
+        _state.update { it.copy(readings = map.readings, chirps = synchronized(chirpObs) { chirpObs.size }) }
     }
 
     /** The tracked pose at [tNs], interpolated; null if the tracking has no pose near it. */
@@ -144,6 +225,7 @@ class SignalMapSession(private val context: Context, private val scope: Coroutin
     private fun openLog(): Writer? = runCatching {
         val dir = File(context.getExternalFilesDir(null), "maps").apply { mkdirs() }
         val name = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.ROOT).format(Date())
+        logName = name
         File(dir, "$name.csv").bufferedWriter().apply { write("t_ms,x,y,z,heading_x,heading_y,rssi,connection\n") }
     }.onFailure { Log.w(TAG, "no map log", it) }.getOrNull()
 

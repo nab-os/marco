@@ -37,7 +37,10 @@ fun SignalMapView(m: MapState, youColor: Color, modifier: Modifier) {
     Canvas(modifier) {
         val here = m.here ?: return@Canvas
         val e = m.estimate
-        val reach = e?.let { hypot(it.x - here.x, it.y - here.y) + it.spreadM } ?: 0.0
+        val reach = maxOf(
+            e?.let { hypot(it.x - here.x, it.y - here.y) + it.spreadM } ?: 0.0,
+            m.acoustic?.let { hypot(it.x - here.x, it.y - here.y) + it.spreadM } ?: 0.0,
+        )
         val radiusM = (reach * 1.15).coerceIn(MIN_RADIUS_M, MAX_RADIUS_M).toFloat()
         val scalePx = size.minDimension / 2 / radiusM
         // The world drawn in metres around you, y flipped (screen y points down) and
@@ -67,6 +70,12 @@ fun SignalMapView(m: MapState, youColor: Color, modifier: Modifier) {
                             val spot = local(it.x, it.y)
                             drawCircle(HOT, it.spreadM.toFloat(), spot, style = Stroke(2.dp.toPx() / scalePx))
                             drawCircle(HOT, 6.dp.toPx() / scalePx, spot)
+                        }
+                        // By sound, while the other phone rings: sharper, in green.
+                        m.acoustic?.let {
+                            val spot = local(it.x, it.y)
+                            drawCircle(SOUND, it.spreadM.toFloat(), spot, style = Stroke(2.dp.toPx() / scalePx))
+                            drawCircle(SOUND, 5.dp.toPx() / scalePx, spot)
                         }
                     }
                 }
@@ -101,6 +110,13 @@ private fun androidx.compose.ui.graphics.drawscope.DrawScope.heat(e: SignalMap.E
 /** What to do next, in words: where the phone likely is from where you stand. */
 fun mapHeadline(m: MapState): String {
     val here = m.here ?: return "Starting the cameras…"
+    m.acoustic?.takeIf { it.spreadM < SOUND_SURE_M }?.let { fix ->
+        val dx = fix.x - here.x
+        val dy = fix.y - here.y
+        val distance = hypot(dx, dy)
+        if (distance < 0.5) return "Right here"
+        return "%.1f m %s".format(distance, direction(here.headingX.toDouble(), here.headingY.toDouble(), dx, dy))
+    }
     val e = m.estimate ?: return "Walk around"
     if (e.spreadM > UNSURE_M) return "Keep walking"
     val dx = e.x - here.x
@@ -112,6 +128,12 @@ fun mapHeadline(m: MapState): String {
 
 fun mapDetail(m: MapState): String {
     m.track.error?.let { return it }
+    m.acoustic?.let { fix ->
+        return "By its ring: within about %.0f cm, from %d chirps".format(maxOf(fix.spreadM, 0.1) * 100, fix.chirps) +
+            if (m.listening) " · listening" else ""
+    }
+    if (m.listening) return "Listening to the ring: walk a metre or two and it will place the phone by sound (${m.chirps} chirps so far)."
+    m.micError?.let { return it }
     val e = m.estimate
     return when {
         m.here == null -> "Hold the phone up, cameras facing the room."
@@ -137,6 +159,9 @@ private fun direction(hx: Double, hy: Double, dx: Double, dy: Double): String {
     }
 }
 
+private val SOUND = Color(0xFF4CD37B)
+/** A sound fix surer than this leads the words. */
+private const val SOUND_SURE_M = 1.0
 private const val MIN_RADIUS_M = 3.0
 private const val MAX_RADIUS_M = 15.0
 private const val MAX_PATH_POINTS = 600

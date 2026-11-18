@@ -4,12 +4,8 @@ import android.app.NotificationManager
 import android.content.Context
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
-import android.media.AudioAttributes
 import android.media.AudioManager
-import android.media.MediaPlayer
-import android.media.RingtoneManager
 import android.media.ToneGenerator
-import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -17,8 +13,9 @@ import android.os.PowerManager
 import android.os.VibrationAttributes
 import android.os.VibrationEffect
 import android.os.VibratorManager
-import android.provider.Settings
 import android.util.Log
+import dev.nabos.marco.acoustic.ChirpPlayer
+import dev.nabos.marco.acoustic.Chirps
 
 /**
  * Makes the phone as findable as possible for a short time: alarm-stream sound at
@@ -35,7 +32,7 @@ class Ringer(private val context: Context) {
     private val vibrator = context.getSystemService(VibratorManager::class.java)!!.defaultVibrator
     private val power = context.getSystemService(PowerManager::class.java)!!
 
-    private var player: MediaPlayer? = null
+    private var player: ChirpPlayer? = null
     private var toneFallback: ToneGenerator? = null
     private var savedAlarmVolume: Int? = null
     private var savedInterruptionFilter: Int? = null
@@ -77,10 +74,7 @@ class Ringer(private val context: Context) {
         handler.removeCallbacks(toneLoop)
         setTorch(false)
         runCatching { vibrator.cancel() }
-        player?.let { p ->
-            runCatching { p.stop() }
-            p.release()
-        }
+        player?.stop()
         player = null
         toneFallback?.release()
         toneFallback = null
@@ -93,23 +87,15 @@ class Ringer(private val context: Context) {
 
     // --- sound -------------------------------------------------------------
 
+    /**
+     * The alarm is the ranging chirp train ([Chirps]): loud, and the finder times
+     * each chirp to place this phone to centimetres.
+     */
     private fun startSound() {
-        val attrs = AudioAttributes.Builder()
-            .setUsage(AudioAttributes.USAGE_ALARM)
-            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-            .build()
-        val uri = soundUri()
         try {
-            player = MediaPlayer().apply {
-                setAudioAttributes(attrs)
-                setDataSource(context, uri)
-                isLooping = true
-                prepare()
-                start()
-            }
+            player = ChirpPlayer(context, Chirps.rangingPeriod(), raiseVolume = false).also { it.start() }
         } catch (e: Exception) {
-            Log.w(TAG, "MediaPlayer failed for $uri, using tone fallback", e)
-            player?.release()
+            Log.w(TAG, "Chirp track failed, using tone fallback", e)
             player = null
             toneFallback = runCatching { ToneGenerator(AudioManager.STREAM_ALARM, ToneGenerator.MAX_VOLUME) }.getOrNull()
             handler.post(toneLoop)
@@ -122,11 +108,6 @@ class Ringer(private val context: Context) {
             handler.postDelayed(this, 900)
         }
     }
-
-    private fun soundUri(): Uri =
-        RingtoneManager.getActualDefaultRingtoneUri(context, RingtoneManager.TYPE_ALARM)
-            ?: RingtoneManager.getActualDefaultRingtoneUri(context, RingtoneManager.TYPE_RINGTONE)
-            ?: Settings.System.DEFAULT_ALARM_ALERT_URI
 
     private fun maxAlarmVolume() {
         try {

@@ -6,17 +6,21 @@ import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioTrack
 
-/** Loops the chirp track on the alarm stream at full volume, as the ring does. */
-class ChirpPlayer(context: Context) {
+/**
+ * Loops one period of PCM on the alarm stream, sample-exactly (a static track
+ * looping in hardware), so the chirps keep the pace of this phone's audio
+ * clock. Raises the alarm volume to full meanwhile unless told not to.
+ */
+class ChirpPlayer(context: Context, private val pcm: ShortArray = Chirps.period(), private val raiseVolume: Boolean = true) {
     private val audio = context.getSystemService(AudioManager::class.java)!!
     private var track: AudioTrack? = null
     private var savedVolume: Int? = null
 
     val playing: Boolean get() = track != null
 
+    /** Throws if the audio track can't be made. */
     fun start() {
         if (track != null) return
-        val pcm = Chirps.period()
         val t = AudioTrack.Builder()
             .setAudioAttributes(
                 AudioAttributes.Builder()
@@ -36,8 +40,10 @@ class ChirpPlayer(context: Context) {
             .build()
         t.write(pcm, 0, pcm.size)
         t.setLoopPoints(0, pcm.size, -1)
-        savedVolume = audio.getStreamVolume(AudioManager.STREAM_ALARM)
-        runCatching { audio.setStreamVolume(AudioManager.STREAM_ALARM, audio.getStreamMaxVolume(AudioManager.STREAM_ALARM), 0) }
+        if (raiseVolume) {
+            savedVolume = audio.getStreamVolume(AudioManager.STREAM_ALARM)
+            runCatching { audio.setStreamVolume(AudioManager.STREAM_ALARM, audio.getStreamMaxVolume(AudioManager.STREAM_ALARM), 0) }
+        }
         t.play()
         track = t
     }

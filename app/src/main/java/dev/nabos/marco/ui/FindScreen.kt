@@ -101,6 +101,12 @@ fun FindScreen(modifier: Modifier, peer: Peer, onBack: () -> Unit) {
     val m by vm.map.state.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val askCamera = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { if (it) vm.startMap() }
+    // The ring is placed by sound if the microphone is allowed; it rings either way.
+    val askMicThenRing = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { vm.engine.ring() }
+    val ring = {
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) vm.engine.ring()
+        else askMicThenRing.launch(Manifest.permission.RECORD_AUDIO)
+    }
     val startMap = {
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) vm.startMap()
         else askCamera.launch(Manifest.permission.CAMERA)
@@ -173,7 +179,7 @@ fun FindScreen(modifier: Modifier, peer: Peer, onBack: () -> Unit) {
 
         val ringActive = s.ringing || s.ringQueued
         Button(
-            onClick = { if (ringActive) vm.engine.stopRinging() else vm.engine.ring() },
+            onClick = { if (ringActive) vm.engine.stopRinging() else ring() },
             modifier = Modifier.fillMaxWidth().height(72.dp),
             colors = if (ringActive) ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
             else ButtonDefaults.buttonColors(),
