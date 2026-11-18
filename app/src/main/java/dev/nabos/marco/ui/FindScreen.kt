@@ -28,7 +28,6 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -44,6 +43,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -117,12 +118,18 @@ fun FindScreen(modifier: Modifier, peer: Peer, onBack: () -> Unit) {
         else askCamera.launch(Manifest.permission.CAMERA)
     }
     val mapUsable = m.running && m.track.error == null
-    LaunchedEffect(peer.id) {
-        if (vm.map.available && !vm.mapOffered) {
+    // Android takes the camera from an app in the background, which the tracking reports
+    // as an error: stop the map on the way out, start it again on return (and the first time).
+    LifecycleEventEffect(Lifecycle.Event.ON_START) {
+        if (!vm.map.available) return@LifecycleEventEffect
+        if (!vm.mapOffered) {
             vm.mapOffered = true
             startMap()
+        } else if (ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+            vm.startMap()
         }
     }
+    LifecycleEventEffect(Lifecycle.Event.ON_STOP) { vm.map.stop() }
 
     // Scan only while this screen is visible, and keep the screen on meanwhile
     // (Android stops delivering unfiltered scan results when the screen is off).

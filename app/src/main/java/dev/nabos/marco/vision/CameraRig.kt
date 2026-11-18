@@ -241,7 +241,13 @@ class CameraRig(context: Context) {
 
             override fun onError(camera: CameraDevice, error: Int) {
                 camera.close()
-                onError("Camera error $error")
+                onError(
+                    when (error) {
+                        CameraDevice.StateCallback.ERROR_CAMERA_IN_USE, CameraDevice.StateCallback.ERROR_MAX_CAMERAS_IN_USE -> "Another app is using the camera."
+                        CameraDevice.StateCallback.ERROR_CAMERA_DISABLED -> "The camera was taken away (the app went to the background, or a policy forbids it)."
+                        else -> "Camera error $error"
+                    },
+                )
             }
         })
     }
