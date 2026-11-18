@@ -49,7 +49,10 @@ def analyse(path):
         for s in range(seconds):
             seg = env[s * PERIOD:(s + 1) * PERIOD]
             peak = int(np.argmax(seg))
-            background = np.median(seg)
+            # The background is the loud end of the rest of the second (its 99th percentile,
+            # the peak's 20 ms left out): what a detector has to stand clear of.
+            rest = np.concatenate([seg[: max(0, peak - RATE // 100)], seg[peak + RATE // 100:]])
+            background = np.percentile(rest, 99)
             margins.append(20 * np.log10(seg[peak] / background) if background > 0 else 0)
             arrivals.append(s * PERIOD + peak)
         margins = np.array(margins)
